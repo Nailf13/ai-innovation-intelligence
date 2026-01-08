@@ -1,0 +1,155 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+
+  body {
+    @apply bg-gray-50 text-gray-900 m-0;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply px-4 py-2 rounded-lg font-medium transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-primary {
+    @apply bg-savencia-primary text-white hover:bg-savencia-primary-dark;
+  }
+
+  .btn-secondary {
+    @apply bg-gray-200 text-gray-800 hover:bg-gray-300;
+  }
+
+  .btn-danger {
+    @apply bg-savencia-danger text-white hover:bg-red-600;
+  }
+
+  .btn-sm {
+    @apply px-3 py-1.5 text-sm;
+  }
+
+  .card {
+    @apply bg-white rounded-xl shadow-sm border border-gray-100;
+  }
+
+  .input {
+    @apply w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-savencia-primary focus:border-transparent outline-none transition-all;
+  }
+
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+
+  .badge-success {
+    @apply bg-green-100 text-green-800;
+  }
+
+  .badge-warning {
+    @apply bg-yellow-100 text-yellow-800;
+  }
+
+  .badge-danger {
+    @apply bg-red-100 text-red-800;
+  }
+
+  .badge-info {
+    @apply bg-blue-100 text-blue-800;
+  }
+
+  .badge-podcast {
+    @apply bg-purple-100 text-purple-800;
+  }
+
+  .badge-document {
+    @apply bg-amber-100 text-amber-800;
+  }
+
+  .badge-pending {
+    @apply bg-gray-100 text-gray-800;
+  }
+
+  .badge-running {
+    @apply bg-blue-100 text-blue-800;
+  }
+
+  .badge-completed {
+    @apply bg-green-100 text-green-800;
+  }
+
+  .badge-failed {
+    @apply bg-red-100 text-red-800;
+  }
+}
+
+/* Adoption level colors */
+.adoption-emerging {
+  @apply bg-yellow-50 border-l-4 border-adoption-emerging;
+}
+
+.adoption-growing {
+  @apply bg-orange-50 border-l-4 border-adoption-growing;
+}
+
+.adoption-mainstream {
+  @apply bg-green-50 border-l-4 border-adoption-mainstream;
+}
+
+.adoption-declining {
+  @apply bg-red-50 border-l-4 border-adoption-declining;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-gray-100 rounded;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-300 rounded hover:bg-gray-400;
+}
+
+/* Audio player styling */
+.audio-player {
+  @apply bg-gray-50 rounded-lg p-4;
+}
+
+.audio-player audio {
+  @apply w-full;
+}
+
+/* Cluster graph node styles */
+.cluster-node {
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.cluster-node:hover {
+  filter: brightness(1.1);
+}
+
+/* Detail panel animations */
+.slide-in {
+  animation: slideIn 0.3s ease-out;
+}
+
+@keyframes slideIn {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
