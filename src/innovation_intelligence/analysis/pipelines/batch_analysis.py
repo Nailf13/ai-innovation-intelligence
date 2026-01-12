@@ -1,22 +1,26 @@
 # src/innovation_intelligence/analysis/pipelines/batch_analysis.py
 """
-Full analysis pipeline for Innovation Intelligence.
+Full analysis pipeline for Innovation Intelligence (GCS-first mode).
 
 This module orchestrates the complete insight analysis workflow:
 1. **Insight Extraction**: Extract unit insights from transcripts via LLM
 2. **Dimension Assessment**: Assess adoption/expectation/progress via RAG
 3. **Macro Insight Discovery**: Cluster unit insights semantically
 4. **Strategic Clustering**: Assign macro insights to strategic clusters
+
+Transcript sources:
+- GCS URIs only: gs://bucket/podcasts/transcripts/episode.json
+- All transcripts must be stored in GCS
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from sqlalchemy.orm import Session
 
+from innovation_intelligence.analysis.insights.insight_extraction import TranscriptSource
 from innovation_intelligence.db.models import (
     Cluster,
     Document,
@@ -47,17 +51,17 @@ class AnalysisPipelineConfig:
     # Extraction settings
     force_reextract: bool = False
 
-    # Dimension assessment settings
-    dimension_top_k: int = 10
-    dimension_min_similarity: float = 0.3
+    # Dimension assessment settings (RAG retrieval parameters)
+    dimension_top_k: int = 3
+    dimension_min_similarity: float = 0.4
 
     # Macro insight discovery settings
-    macro_similarity_threshold: float = 0.72
+    macro_similarity_threshold: float = 0.7
     use_llm_naming: bool = True
     generate_macro_descriptions: bool = True
 
     # Strategic clustering settings
-    cluster_similarity_threshold: float = 0.75
+    cluster_similarity_threshold: float = 0.5
 
     # Processing options
     batch_size: int = 10  # Process N sources at a time
@@ -150,11 +154,13 @@ class PipelineResult:
 def _run_extraction_stage(
     session: Session,
     sources: List[SourceEntity],
-    transcript_paths: Dict[int, Path],
+    transcript_sources: Dict[int, TranscriptSource],
     config: AnalysisPipelineConfig,
 ) -> StageResult:
     """
     Run the insight extraction stage.
+
+    GCS-first mode: Only GCS URIs are supported as transcript sources.
     """
     import time
     from innovation_intelligence.analysis.insights.insight_extraction import (
@@ -165,18 +171,17 @@ def _run_extraction_stage(
     result = StageResult(stage_name="1. Insight Extraction", success=True)
 
     for source in sources:
-        transcript_path = transcript_paths.get(source.id)
-        if not transcript_path:
+        transcript_source = transcript_sources.get(source.id)
+        if not transcript_source:
             result.errors.append(f"No transcript for source {source.id}")
             continue
 
         try:
             extraction, unit_insights = extract_and_persist_insights(
-                transcript_path=transcript_path,
+                gcs_uri=transcript_source,
                 session=session,
                 source=source,
                 force=config.force_reextract,
-                assess_dimensions=False,  # Handled in stage 2
             )
 
             result.items_processed += 1
@@ -244,12 +249,26 @@ def _run_dimension_assessment_stage(
         assessments = service.assess_new_insights()
 
         result.items_processed = len(assessments)
-        result.items_created = sum(
-            (1 if a.adoption else 0) +
-            (1 if a.expectation else 0) +
-            (1 if a.progress else 0)
-            for a in assessments
-        )
+
+        # Count dimensions created (handle both TrendDimensions and StakeDimensions)
+        dimensions_count = 0
+        for a in assessments:
+            # Check if it's a TrendDimensions (has adoption attribute)
+            if hasattr(a, 'adoption'):
+                dimensions_count += sum([
+                    1 if a.adoption else 0,
+                    1 if a.expectation else 0,
+                    1 if a.progress else 0,
+                ])
+            # Otherwise it's a StakeDimensions (has criticality attribute)
+            elif hasattr(a, 'criticality'):
+                dimensions_count += sum([
+                    1 if a.criticality else 0,
+                    1 if a.urgency else 0,
+                    1 if a.actionability else 0,
+                ])
+
+        result.items_created = dimensions_count
 
         log.info(
             f"[PIPELINE] Assessed {result.items_created} dimensions "
@@ -344,37 +363,84 @@ def _run_strategic_clustering_stage(
 ) -> StageResult:
     """
     Run the strategic clustering stage.
+
+    This stage performs two types of clustering:
+    1. Assign MacroInsights to strategic clusters
+    2. Assign orphan UnitInsights (without MacroInsight) directly to strategic clusters
     """
     import time
     from innovation_intelligence.analysis.clustering.clustering import (
         assign_and_persist_macro_insights,
+        assign_and_persist_orphan_unit_insights,
     )
 
     start = time.time()
     result = StageResult(stage_name="4. Strategic Clustering", success=True)
 
     try:
+        # Part 1: Cluster MacroInsights
+        log.info("[PIPELINE] Clustering MacroInsights to strategic clusters...")
+
         # Count unassigned macro insights before
-        unassigned_before = session.query(MacroInsight).filter(
+        unassigned_macros = session.query(MacroInsight).filter(
             MacroInsight.cluster_id.is_(None)
         ).count()
 
-        result.items_processed = unassigned_before
-
-        # Run clustering
-        clustering_result = assign_and_persist_macro_insights(
+        # Run macro insight clustering
+        macro_clustering_result = assign_and_persist_macro_insights(
             session,
             similarity_threshold=config.cluster_similarity_threshold,
         )
 
-        result.items_created = clustering_result.total_processed
+        log.info(
+            f"[PIPELINE] Assigned {macro_clustering_result.total_processed} macro insights "
+            f"to {len(macro_clustering_result.clusters_used)} clusters"
+        )
 
-        result.details["clusters_used"] = clustering_result.clusters_used
-        result.details["assigned_to_other"] = clustering_result.total_assigned_to_other
+        # Part 2: Cluster orphan UnitInsights (without MacroInsight)
+        log.info("[PIPELINE] Clustering orphan UnitInsights to strategic clusters...")
+
+        # Count orphan unit insights
+        orphan_units = session.query(UnitInsight).filter(
+            UnitInsight.macro_insight_id.is_(None),
+            UnitInsight.cluster_id.is_(None)
+        ).count()
+
+        # Run orphan unit insight clustering
+        unit_clustering_result = assign_and_persist_orphan_unit_insights(
+            session,
+            similarity_threshold=config.cluster_similarity_threshold,
+        )
 
         log.info(
-            f"[PIPELINE] Assigned {clustering_result.total_processed} macro insights "
-            f"to {len(clustering_result.clusters_used)} clusters"
+            f"[PIPELINE] Assigned {unit_clustering_result.total_processed} orphan unit insights "
+            f"to {len(unit_clustering_result.clusters_used)} clusters"
+        )
+
+        # Combine results
+        result.items_processed = unassigned_macros + orphan_units
+        result.items_created = macro_clustering_result.total_processed + unit_clustering_result.total_processed
+
+        # Merge cluster usage statistics
+        all_clusters_used = {}
+        for cluster_name, count in macro_clustering_result.clusters_used.items():
+            all_clusters_used[cluster_name] = all_clusters_used.get(cluster_name, 0) + count
+        for cluster_name, count in unit_clustering_result.clusters_used.items():
+            all_clusters_used[cluster_name] = all_clusters_used.get(cluster_name, 0) + count
+
+        result.details["clusters_used"] = all_clusters_used
+        result.details["macro_insights_assigned"] = macro_clustering_result.total_processed
+        result.details["unit_insights_assigned"] = unit_clustering_result.total_processed
+        result.details["assigned_to_other"] = (
+            macro_clustering_result.total_assigned_to_other +
+            unit_clustering_result.total_assigned_to_other
+        )
+
+        log.info(
+            f"[PIPELINE] Strategic clustering complete: "
+            f"{macro_clustering_result.total_processed} macro insights + "
+            f"{unit_clustering_result.total_processed} orphan unit insights assigned "
+            f"to {len(all_clusters_used)} clusters"
         )
 
     except Exception as e:
@@ -389,57 +455,93 @@ def _run_strategic_clustering_stage(
 
 
 # ---------------------------------------------------------------------
-# Source Discovery (FIXED)
+# Source Discovery
 # ---------------------------------------------------------------------
 def _discover_sources(
     session: Session,
-    transcripts_dir: Optional[Path] = None,
-    podcast_transcripts_dir: Optional[Path] = None,
-    document_transcripts_dir: Optional[Path] = None,
-) -> tuple[List[SourceEntity], Dict[int, Path]]:
+    force_reextract: bool = False,
+) -> tuple[List[SourceEntity], Dict[int, TranscriptSource]]:
     """
-    Discover sources and their transcript paths from the database.
+    Discover sources ready for analysis (GCS-first mode).
 
-    Uses the transcript_path stored in the database, not file discovery.
+    Only returns sources that are "ready for analysis":
+    - Have GCS transcript URI
+    - Have indexed chunks in vector store
+    - Do NOT have insights yet (unless force_reextract=True)
+
+    Args:
+        session: Database session
+        force_reextract: If True, include already-analyzed sources
+
+    Returns:
+        Tuple of (sources list, transcript_sources dict mapping source.id to GCS URI)
     """
-    from innovation_intelligence.config import settings
+    from sqlalchemy import exists, and_
+    from innovation_intelligence.db.models import PodcastChunkVector, DocumentChunkVector
 
     sources: List[SourceEntity] = []
-    transcript_paths: Dict[int, Path] = {}
+    transcript_sources: Dict[int, TranscriptSource] = {}
 
-    # Discover podcast episodes with transcripts
-    episodes = session.query(PodcastEpisode).filter(
-        PodcastEpisode.transcript_path.isnot(None)
-    ).all()
+    # Build query for podcast episodes READY FOR ANALYSIS
+    episodes_query = session.query(PodcastEpisode).filter(
+        and_(
+            PodcastEpisode.gcs_transcript_uri.isnot(None),
+            # Has indexed chunks
+            exists().where(
+                PodcastChunkVector.source == (
+                    PodcastEpisode.podcast_name + " - " + PodcastEpisode.episode_title
+                )
+            ),
+        )
+    )
+
+    # Exclude already-analyzed episodes unless force_reextract
+    if not force_reextract:
+        episodes_query = episodes_query.filter(
+            ~exists().where(UnitInsight.episode_id == PodcastEpisode.id)
+        )
+
+    episodes = episodes_query.all()
 
     for episode in episodes:
-        transcript_file = Path(episode.transcript_path)
-        if transcript_file.exists():
+        if episode.gcs_transcript_uri:
+            log.debug(f"[PIPELINE] Using GCS transcript for episode {episode.id}: {episode.gcs_transcript_uri}")
             sources.append(episode)
-            transcript_paths[episode.id] = transcript_file
-        else:
-            log.warning(f"[PIPELINE] Transcript file not found for episode {episode.id}: {transcript_file}")
+            transcript_sources[episode.id] = episode.gcs_transcript_uri
 
-    podcast_count = len([s for s in sources if isinstance(s, PodcastEpisode)])
-    log.info(f"[PIPELINE] Found {podcast_count} podcast episodes with transcripts")
+    podcast_count = len(episodes)
+    log.info(f"[PIPELINE] Found {podcast_count} podcast episodes ready for analysis")
 
-    # Discover documents with transcripts
-    documents = session.query(Document).filter(
-        Document.transcript_path.isnot(None)
-    ).all()
+    # Build query for documents READY FOR ANALYSIS
+    documents_query = session.query(Document).filter(
+        and_(
+            Document.gcs_transcript_uri.isnot(None),
+            # Has indexed chunks
+            exists().where(
+                DocumentChunkVector.source == Document.title
+            ),
+        )
+    )
+
+    # Exclude already-analyzed documents unless force_reextract
+    if not force_reextract:
+        documents_query = documents_query.filter(
+            ~exists().where(UnitInsight.document_id == Document.id)
+        )
+
+    documents = documents_query.all()
 
     for doc in documents:
-        transcript_file = Path(doc.transcript_path)
-        if transcript_file.exists():
+        if doc.gcs_transcript_uri:
+            log.debug(f"[PIPELINE] Using GCS transcript for document {doc.id}: {doc.gcs_transcript_uri}")
             sources.append(doc)
-            transcript_paths[doc.id] = transcript_file
-        else:
-            log.warning(f"[PIPELINE] Transcript file not found for document {doc.id}: {transcript_file}")
+            transcript_sources[doc.id] = doc.gcs_transcript_uri
 
-    document_count = len([s for s in sources if isinstance(s, Document)])
-    log.info(f"[PIPELINE] Found {document_count} documents with transcripts")
+    document_count = len(documents)
+    log.info(f"[PIPELINE] Found {document_count} documents ready for analysis")
+    log.info(f"[PIPELINE] Total sources ready for analysis: {len(sources)}")
 
-    return sources, transcript_paths
+    return sources, transcript_sources
 
 
 # ---------------------------------------------------------------------
@@ -447,20 +549,25 @@ def _discover_sources(
 # ---------------------------------------------------------------------
 def run_full_analysis(
     session: Session,
-    transcripts_dir: Optional[Path] = None,
     *,
     config: Optional[AnalysisPipelineConfig] = None,
     sources: Optional[List[SourceEntity]] = None,
-    transcript_paths: Optional[Dict[int, Path]] = None,
+    transcript_sources: Optional[Dict[int, TranscriptSource]] = None,
 ) -> PipelineResult:
     """
-    Run the complete analysis pipeline.
+    Run the complete analysis pipeline (GCS-first mode).
 
     Stages:
-    1. Insight Extraction - Extract unit insights from transcripts
+    1. Insight Extraction - Extract unit insights from transcripts (GCS only)
     2. Dimension Assessment - Assess adoption/expectation/progress via RAG
     3. Macro Insight Discovery - Cluster unit insights semantically
     4. Strategic Clustering - Assign macro insights to strategic clusters
+
+    Args:
+        session: Database session
+        config: Pipeline configuration
+        sources: Optional list of sources to process
+        transcript_sources: Optional dict mapping source.id to GCS URI
     """
     config = config or AnalysisPipelineConfig()
     result = PipelineResult()
@@ -470,33 +577,33 @@ def run_full_analysis(
     log.info("=" * 60)
 
     # Discover sources if not provided
-    if sources is None or transcript_paths is None:
-        sources, transcript_paths = _discover_sources(session, transcripts_dir)
+    if sources is None or transcript_sources is None:
+        sources, transcript_sources = _discover_sources(session, config.force_reextract)
 
     if not sources:
-        log.warning("[PIPELINE] No sources found to process")
+        log.warning("[PIPELINE] No sources ready for analysis")
         result.complete()
         return result
 
     log.info(f"[PIPELINE] Processing {len(sources)} sources")
 
-    # # Stage 1: Insight Extraction
-    # if config.run_extraction:
-    #     log.info("-" * 60)
-    #     log.info("[PIPELINE] Stage 1: Insight Extraction")
-    #     stage_result = _run_extraction_stage(
-    #         session, sources, transcript_paths, config
-    #     )
-    #     result.add_stage(stage_result)
+    # Stage 1: Insight Extraction
+    if config.run_extraction:
+        log.info("-" * 60)
+        log.info("[PIPELINE] Stage 1: Insight Extraction")
+        stage_result = _run_extraction_stage(
+            session, sources, transcript_sources, config
+        )
+        result.add_stage(stage_result)
 
-    #     if not stage_result.success and not config.continue_on_error:
-    #         result.complete()
-    #         return result
+        if not stage_result.success and not config.continue_on_error:
+            result.complete()
+            return result
 
     # Stage 2: Macro Insight Discovery
     if config.run_macro_discovery:
         log.info("-" * 60)
-        log.info("[PIPELINE] Stage 3: Macro Insight Discovery")
+        log.info("[PIPELINE] Stage 2: Macro Insight Discovery")
         stage_result = _run_macro_discovery_stage(session, config)
         result.add_stage(stage_result)
 
@@ -511,16 +618,16 @@ def run_full_analysis(
         stage_result = _run_strategic_clustering_stage(session, config)
         result.add_stage(stage_result)
 
-    # # Stage 4: Dimension Assessment
-    # if config.run_dimension_assessment:
-    #     log.info("-" * 60)
-    #     log.info("[PIPELINE] Stage 4: Dimension Assessment")
-    #     stage_result = _run_dimension_assessment_stage(session, config)
-    #     result.add_stage(stage_result)
+    # Stage 4: Dimension Assessment
+    if config.run_dimension_assessment:
+        log.info("-" * 60)
+        log.info("[PIPELINE] Stage 4: Dimension Assessment")
+        stage_result = _run_dimension_assessment_stage(session, config)
+        result.add_stage(stage_result)
 
-    #     if not stage_result.success and not config.continue_on_error:
-    #         result.complete()
-    #         return result
+        if not stage_result.success and not config.continue_on_error:
+            result.complete()
+            return result
 
     result.complete()
 
@@ -540,14 +647,14 @@ def run_analysis_from_insights(
     config = config or AnalysisPipelineConfig()
     config.run_extraction = False
 
-    return run_full_analysis(session, config=config, sources=[], transcript_paths={})
+    return run_full_analysis(session, config=config, sources=[], transcript_sources={})
 
 
 def run_clustering_only(
     session: Session,
     *,
-    macro_similarity_threshold: float = 0.72,
-    cluster_similarity_threshold: float = 0.75,
+    macro_similarity_threshold: float = 0.7,
+    cluster_similarity_threshold: float = 0.5,
 ) -> PipelineResult:
     """
     Run only the clustering stages (macro discovery + strategic clustering).
@@ -561,7 +668,7 @@ def run_clustering_only(
         cluster_similarity_threshold=cluster_similarity_threshold,
     )
 
-    return run_full_analysis(session, config=config, sources=[], transcript_paths={})
+    return run_full_analysis(session, config=config, sources=[], transcript_sources={})
 
 
 # ---------------------------------------------------------------------
@@ -570,40 +677,135 @@ def run_clustering_only(
 def get_pipeline_statistics(session: Session) -> Dict[str, Any]:
     """
     Get current statistics for all pipeline entities.
+
+    Updated to:
+    1. Count only content NOT YET ANALYZED (no UnitInsight records)
+    2. Separate "ready for analysis" from "analyzed"
     """
-    from sqlalchemy import func
-    from innovation_intelligence.db.models import InsightDimension
+    from sqlalchemy import func, exists, and_
+    from innovation_intelligence.db.models import InsightDimension, PodcastChunkVector, DocumentChunkVector
+
+    # Count total podcasts and documents
+    podcast_episodes_total = session.query(PodcastEpisode).count()
+    documents_total = session.query(Document).count()
+
+    # Count podcasts READY FOR ANALYSIS (transcribed + indexed BUT no insights yet)
+    podcasts_ready = (
+        session.query(PodcastEpisode)
+        .filter(
+            and_(
+                PodcastEpisode.gcs_transcript_uri.isnot(None),
+                # Has indexed chunks
+                exists().where(
+                    PodcastChunkVector.source == (
+                        PodcastEpisode.podcast_name + " - " + PodcastEpisode.episode_title
+                    )
+                ),
+                # Does NOT have insights yet (key change)
+                ~exists().where(UnitInsight.episode_id == PodcastEpisode.id)
+            )
+        )
+        .count()
+    )
+
+    # Count documents READY FOR ANALYSIS (transcribed + indexed BUT no insights yet)
+    documents_ready = (
+        session.query(Document)
+        .filter(
+            and_(
+                Document.gcs_transcript_uri.isnot(None),
+                # Has indexed chunks
+                exists().where(
+                    DocumentChunkVector.source == Document.title
+                ),
+                # Does NOT have insights yet (key change)
+                ~exists().where(UnitInsight.document_id == Document.id)
+            )
+        )
+        .count()
+    )
+
+    # Count ANALYZED items (have UnitInsight records)
+    podcasts_analyzed = (
+        session.query(PodcastEpisode.id)
+        .filter(
+            exists().where(UnitInsight.episode_id == PodcastEpisode.id)
+        )
+        .distinct()
+        .count()
+    )
+
+    documents_analyzed = (
+        session.query(Document.id)
+        .filter(
+            exists().where(UnitInsight.document_id == Document.id)
+        )
+        .distinct()
+        .count()
+    )
+
+    # Get unit insights statistics with type breakdown
+    total_unit_insights = session.query(UnitInsight).count()
+
+    trends_count = session.query(UnitInsight).filter(
+        UnitInsight.type == "trend"
+    ).count()
+
+    health_stakes_count = session.query(UnitInsight).filter(
+        UnitInsight.type == "health_stake"
+    ).count()
+
+    unit_insights_with_macro = session.query(UnitInsight).filter(
+        UnitInsight.macro_insight_id.isnot(None)
+    ).count()
+
+    # Count orphan unit insights with direct cluster assignment
+    unit_insights_with_cluster = session.query(UnitInsight).filter(
+        UnitInsight.macro_insight_id.is_(None),
+        UnitInsight.cluster_id.isnot(None)
+    ).count()
+
+    # Get macro insights statistics
+    total_macro_insights = session.query(MacroInsight).count()
+    macro_with_cluster = session.query(MacroInsight).filter(
+        MacroInsight.cluster_id.isnot(None)
+    ).count()
+
+    # Get cluster statistics
+    total_clusters = session.query(Cluster).count()
+
+    # Get dimensions assessed
+    dimensions_assessed = session.query(InsightDimension).count()
 
     stats = {
+        # Pipeline stats (ready for analysis - NOT analyzed yet)
+        "podcast_episodes": podcasts_ready,
+        "podcast_episodes_total": podcast_episodes_total,
+        "podcasts_analyzed": podcasts_analyzed,  # NEW
+        "documents": documents_ready,
+        "documents_total": documents_total,
+        "documents_analyzed": documents_analyzed,  # NEW
+
+        # Unit insights stats with type breakdown
         "unit_insights": {
-            "total": session.query(UnitInsight).count(),
-            "with_macro": session.query(UnitInsight).filter(
-                UnitInsight.macro_insight_id.isnot(None)
-            ).count(),
-            "without_macro": session.query(UnitInsight).filter(
-                UnitInsight.macro_insight_id.is_(None)
-            ).count(),
+            "total": total_unit_insights,
+            "trends": trends_count,
+            "health_stakes": health_stakes_count,
+            "with_macro": unit_insights_with_macro,
+            "orphans_with_cluster": unit_insights_with_cluster,
+            "orphans_without_cluster": total_unit_insights - unit_insights_with_macro - unit_insights_with_cluster,
         },
-        "dimensions": {
-            "total": session.query(InsightDimension).count(),
-            "by_type": dict(
-                session.query(
-                    InsightDimension.dimension_type,
-                    func.count(InsightDimension.id)
-                ).group_by(InsightDimension.dimension_type).all()
-            ),
-        },
+
+        # Macro insights stats
         "macro_insights": {
-            "total": session.query(MacroInsight).count(),
-            "with_cluster": session.query(MacroInsight).filter(
-                MacroInsight.cluster_id.isnot(None)
-            ).count(),
-            "without_cluster": session.query(MacroInsight).filter(
-                MacroInsight.cluster_id.is_(None)
-            ).count(),
+            "total": total_macro_insights,
+            "with_cluster": macro_with_cluster,
+            "without_cluster": total_macro_insights - macro_with_cluster,
         },
+
+        # Cluster stats
         "clusters": {
-            "total": session.query(Cluster).count(),
+            "total": total_clusters,
             "by_name": dict(
                 session.query(Cluster.name, func.count(MacroInsight.id))
                 .outerjoin(MacroInsight)
@@ -611,10 +813,8 @@ def get_pipeline_statistics(session: Session) -> Dict[str, Any]:
                 .all()
             ),
         },
-        "sources": {
-            "podcast_episodes": session.query(PodcastEpisode).count(),
-            "documents": session.query(Document).count(),
-        },
+
+        "dimensions_assessed": dimensions_assessed,
     }
 
     return stats

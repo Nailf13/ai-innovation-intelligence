@@ -53,13 +53,6 @@ export function PipelinesPage() {
     },
   });
 
-  // Run indexing mutation
-  const runIndexingMutation = useMutation({
-    mutationFn: () => ingestionApi.runIndexing(),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['ingestion', 'tasks'] });
-    },
-  });
 
   // Delete task mutation
   const deleteTaskMutation = useMutation({
@@ -94,32 +87,29 @@ export function PipelinesPage() {
       />
 
       <div className="flex-1 p-6 overflow-auto">
-        {/* Stats Cards */}
-        <div className="grid grid-cols-4 gap-4 mb-6">
+        {/* Stats Cards - Only showing items ready for analysis */}
+        <div className="grid grid-cols-2 gap-4 mb-6">
           <StatCard
             icon={Mic}
-            label="Podcast Episodes"
+            label="Podcasts Ready for Analysis"
             value={stats?.podcast_episodes || 0}
+            subtitle={`${stats?.podcasts_analyzed || 0} analyzed`}
             color="purple"
           />
           <StatCard
             icon={FileText}
-            label="Documents"
+            label="Documents Ready for Analysis"
             value={stats?.documents || 0}
+            subtitle={`${stats?.documents_analyzed || 0} analyzed`}
             color="amber"
           />
-          <StatCard
-            icon={Layers}
-            label="Unit Insights"
-            value={stats?.unit_insights?.total || 0}
-            color="blue"
-          />
-          <StatCard
-            icon={BarChart3}
-            label="Macro Insights"
-            value={stats?.macro_insights?.total || 0}
-            color="green"
-          />
+        </div>
+
+        {/* Helper text explaining "Ready" counts */}
+        <div className="text-sm text-gray-500 mb-4">
+          <strong>Ready for Analysis:</strong> Content that has been transcribed and indexed, but not yet analyzed (no insights extracted).
+          <br />
+          These counts are the source of truth for items available for the analysis pipeline.
         </div>
 
         {/* Actions */}
@@ -131,14 +121,6 @@ export function PipelinesPage() {
           >
             <Play className="w-4 h-4" />
             Run Full Analysis
-          </button>
-          <button
-            onClick={() => runIndexingMutation.mutate()}
-            disabled={runIndexingMutation.isPending}
-            className="btn btn-secondary flex items-center gap-2"
-          >
-            <RefreshCw className="w-4 h-4" />
-            Run Vector Indexing
           </button>
         </div>
 
@@ -225,10 +207,11 @@ interface StatCardProps {
   icon: typeof Mic;
   label: string;
   value: number;
+  subtitle?: string;
   color: 'purple' | 'amber' | 'blue' | 'green';
 }
 
-function StatCard({ icon: Icon, label, value, color }: StatCardProps) {
+function StatCard({ icon: Icon, label, value, subtitle, color }: StatCardProps) {
   const colors = {
     purple: 'bg-purple-100 text-purple-600',
     amber: 'bg-amber-100 text-amber-600',
@@ -245,6 +228,7 @@ function StatCard({ icon: Icon, label, value, color }: StatCardProps) {
         <div>
           <p className="text-2xl font-semibold text-gray-900">{value}</p>
           <p className="text-sm text-gray-500">{label}</p>
+          {subtitle && <p className="text-xs text-gray-400 mt-0.5">{subtitle}</p>}
         </div>
       </div>
     </div>

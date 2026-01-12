@@ -24,12 +24,10 @@ _ingestion_tasks: dict[str, dict] = {}
 
 
 def _run_podcast_transcription(episode_id: int, task_id: str):
-    """Background task for podcast transcription."""
-    import json
-    from pathlib import Path
-
-    from innovation_intelligence.config import settings
+    """Background task for podcast transcription using Chirp (Google Speech API)."""
     from innovation_intelligence.db.session import SessionLocal
+    from innovation_intelligence.ingestion.podcasts.chirp_transcription import ChirpTranscriptionService
+    from innovation_intelligence.ingestion.gcs_service import GCSStorageService
 
     session = SessionLocal()
     try:
@@ -41,58 +39,35 @@ def _run_podcast_transcription(episode_id: int, task_id: str):
             _ingestion_tasks[task_id]["error"] = f"Episode {episode_id} not found"
             return
 
-        # Check if audio file exists
-        if not episode.audio_path:
+        # Check if audio file exists in GCS
+        if not episode.gcs_audio_uri:
             _ingestion_tasks[task_id]["status"] = TaskStatus.FAILED
-            _ingestion_tasks[task_id]["error"] = "No audio file available"
+            _ingestion_tasks[task_id]["error"] = "No audio file available in GCS"
             return
 
-        audio_path = Path(episode.audio_path)
-        if not audio_path.exists():
-            _ingestion_tasks[task_id]["status"] = TaskStatus.FAILED
-            _ingestion_tasks[task_id]["error"] = f"Audio file not found: {audio_path}"
-            return
+        # Run transcription from GCS using Chirp
+        log.info("[INGESTION] Starting Chirp transcription for episode %d from GCS", episode_id)
 
-        # Run transcription via Modal (lookup deployed app)
-        import modal
+        chirp_service = ChirpTranscriptionService()
+        gcs_service = GCSStorageService()
 
-        log.info("[INGESTION] Starting transcription for episode %d", episode_id)
+        # Transcribe from GCS using Chirp
+        transcript_data = chirp_service.transcribe(gcs_uri=episode.gcs_audio_uri)
 
-        # Read audio file and send to Modal for transcription
-        audio_bytes = audio_path.read_bytes()
-
-        # Lookup the deployed Modal function directly
-        Model = modal.Cls.from_name(
-            "whisperx-podcast-pipeline", "Model"
+        # Store transcript in GCS
+        gcs_transcript_uri = gcs_service.store_transcript(
+            data=transcript_data,
+            content_id=str(episode_id),
+            content_type="podcast"
         )
-        model_instance = Model()
-        transcript_json = model_instance.transcribe_with_diarization.remote(audio_bytes)
 
-        # Parse the JSON result
-        transcript_data = json.loads(transcript_json)
-
-        # Add metadata
-        transcript_data["_metadata"] = {
-            "episode_id": episode_id,
-            "episode_title": episode.episode_title,
-            "podcast_name": episode.podcast_name,
-        }
-
-        # Save transcript to file
-        transcript_dir = settings.paths.transcripts_dir
-        transcript_dir.mkdir(parents=True, exist_ok=True)
-        transcript_path = transcript_dir / f"episode_{episode_id}.json"
-
-        with open(transcript_path, "w", encoding="utf-8") as f:
-            json.dump(transcript_data, f, ensure_ascii=False, indent=2)
-
-        # Update episode with transcript path
-        episode.transcript_path = str(transcript_path)
+        # Update episode with transcript GCS URI
+        episode.gcs_transcript_uri = gcs_transcript_uri
         session.commit()
 
         _ingestion_tasks[task_id]["status"] = TaskStatus.COMPLETED
-        _ingestion_tasks[task_id]["result"] = {"transcript_path": str(transcript_path)}
-        log.info("[INGESTION] Transcription completed for episode %d", episode_id)
+        _ingestion_tasks[task_id]["result"] = {"gcs_transcript_uri": gcs_transcript_uri}
+        log.info("[INGESTION] Transcription completed for episode %d: %s", episode_id, gcs_transcript_uri)
 
     except Exception as e:
         log.error("[INGESTION] Transcription failed: %s", e)
@@ -102,10 +77,10 @@ def _run_podcast_transcription(episode_id: int, task_id: str):
         session.close()
 
 
-def _run_vector_indexing(task_id: str, podcasts_only: bool, documents_only: bool, with_speaker_id: bool):
+def _run_vector_indexing(task_id: str, podcasts_only: bool, documents_only: bool):
     """Background task for vector indexing."""
     from innovation_intelligence.db.session import SessionLocal
-    from innovation_intelligence.ingestion.vector_indexing.pipeline import run_indexing_pipeline
+    from innovation_intelligence.ingestion.indexing.pipeline import run_indexing_pipeline
 
     session = SessionLocal()
     try:
@@ -116,7 +91,6 @@ def _run_vector_indexing(task_id: str, podcasts_only: bool, documents_only: bool
             session,
             podcasts_only=podcasts_only,
             documents_only=documents_only,
-            with_speaker_identification=with_speaker_id,
         )
 
         _ingestion_tasks[task_id]["status"] = TaskStatus.COMPLETED
@@ -143,14 +117,15 @@ async def transcribe_episode(
     """
     Start transcription for a podcast episode.
 
-    Runs WhisperX transcription via Modal (requires Modal setup and HF_TOKEN).
+    Uses Google Speech-to-Text API (Chirp model) for audio transcription.
+    Transcribes directly from GCS without local file downloads.
     """
     episode = db.get(PodcastEpisode, episode_id)
     if not episode:
         raise HTTPException(status_code=404, detail="Episode not found")
 
-    if not episode.audio_path:
-        raise HTTPException(status_code=400, detail="Episode has no audio file. Download first.")
+    if not episode.gcs_audio_uri:
+        raise HTTPException(status_code=400, detail="Episode has no audio file in GCS. Download first.")
 
     import uuid
     task_id = f"transcribe_{episode_id}_{uuid.uuid4().hex[:8]}"
@@ -201,7 +176,6 @@ async def run_vector_indexing(
         task_id,
         request.podcasts_only,
         request.documents_only,
-        request.with_speaker_identification,
     )
 
     return IngestionStatusResponse(

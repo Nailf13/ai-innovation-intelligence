@@ -10,6 +10,12 @@ export type ExpectationLevel = 'Low' | 'Moderate' | 'High';
 
 export type ProgressHorizon = 'Near-term (0-12 months)' | 'Mid-term (1-3 years)' | 'Long-term (3+ years)';
 
+export type CriticalityLevel = 'Low' | 'Moderate' | 'High';
+
+export type UrgencyLevel = 'Long-term' | 'Mid-term' | 'Immediate';
+
+export type ActionabilityLevel = 'Hard to address' | 'Moderately addressable' | 'Highly addressable';
+
 // Podcast Types
 export interface PodcastSearchResult {
   feed_id: number;
@@ -25,9 +31,9 @@ export interface PodcastEpisode {
   id: number;
   podcast_name: string;
   episode_title: string;
-  audio_path?: string;
   audio_url?: string;
-  transcript_path?: string;
+  gcs_audio_uri?: string;
+  gcs_transcript_uri?: string;
   episode_date?: string;
   created_at: string;
 }
@@ -55,8 +61,8 @@ export interface Document {
   id: number;
   title: string;
   source_type?: string;
-  file_path: string;
-  transcript_path?: string;
+  gcs_document_uri?: string;
+  gcs_transcript_uri?: string;
   document_date?: string;
   created_at: string;
 }
@@ -67,6 +73,8 @@ export interface IngestionTask {
   task_type: string;
   status: TaskStatus;
   entity_id?: number;
+  current_stage?: string;
+  progress?: number;
   error?: string;
   result?: Record<string, unknown>;
 }
@@ -94,10 +102,16 @@ export interface StageResult {
 }
 
 export interface PipelineStats {
-  podcast_episodes: number;
-  documents: number;
+  podcast_episodes: number;  // Ready for analysis (not analyzed yet)
+  podcast_episodes_total: number;
+  podcasts_analyzed: number;  // Analyzed count
+  documents: number;  // Ready for analysis (not analyzed yet)
+  documents_total: number;
+  documents_analyzed: number;  // Analyzed count
   unit_insights: {
     total: number;
+    trends: number;
+    health_stakes: number;
     with_macro: number;
     without_macro: number;
   };
@@ -114,12 +128,24 @@ export interface PipelineStats {
 }
 
 // Insight Types
+export interface EvidenceItem {
+  text: string;
+  source_ref?: string;
+  similarity_score?: number;
+  // Podcast metadata
+  start_time?: number;
+  end_time?: number;
+  // Document metadata
+  page?: number;
+  section?: string;
+}
+
 export interface Dimension {
   id?: number;
-  dimension_type: 'adoption' | 'expectation' | 'progress';
+  dimension_type: 'adoption' | 'expectation' | 'progress' | 'criticality' | 'urgency' | 'actionability';
   value: string;
   confidence?: number;
-  evidence: string[];
+  evidence: EvidenceItem[];
 }
 
 export interface UnitInsight {
@@ -167,6 +193,11 @@ export interface InsightHierarchy {
         type: InsightType;
       }>;
     }>;
+    orphan_unit_insights: Array<{
+      id: number;
+      name: string;
+      type: InsightType;
+    }>;
   }>;
   unassigned_macro_insights: Array<{
     id: number;
@@ -202,4 +233,28 @@ export interface ListResponse<T> {
   documents?: T[];
   clusters?: T[];
   results?: T[];
+}
+
+// Visualization Types
+export interface TrendVisualizationPoint {
+  id: number;
+  name: string;
+  description: string;
+  expectation?: ExpectationLevel | null;
+  progress?: ProgressHorizon | null;
+  adoption?: AdoptionLevel | null;
+}
+
+export interface StakeVisualizationPoint {
+  id: number;
+  name: string;
+  description: string;
+  criticality?: CriticalityLevel | null;
+  urgency?: UrgencyLevel | null;
+  actionability?: ActionabilityLevel | null;
+}
+
+export interface VisualizationData {
+  trends: TrendVisualizationPoint[];
+  stakes: StakeVisualizationPoint[];
 }

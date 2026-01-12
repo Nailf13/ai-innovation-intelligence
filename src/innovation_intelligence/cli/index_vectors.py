@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # src/innovation_intelligence/cli/index_vectors.py
 """
-CLI entrypoint for vector indexing.
+CLI entrypoint for vector indexing (GCS-first mode).
+
+All content is loaded from GCS URIs stored in the database.
+Content must be ingested first using ingest-podcasts or ingest-documents.
 
 Usage:
     python -m innovation_intelligence.cli.index_vectors --help
@@ -20,28 +23,22 @@ from innovation_intelligence.config import settings
 
 
 def cmd_run(args):
-    """Run vector indexing."""
-    from innovation_intelligence.ingestion.vector_indexing.pipeline import (
+    """Run vector indexing from database (GCS-first mode)."""
+    from innovation_intelligence.ingestion.indexing.pipeline import (
         index_podcasts,
         index_documents,
         run_full_ingestion,
     )
 
-    podcasts_dir = Path(args.podcasts_dir) if args.podcasts_dir else None
-    documents_dir = Path(args.documents_dir) if args.documents_dir else None
-
     if args.podcasts_only:
-        print("Indexing podcasts only...")
-        stats = index_podcasts(podcasts_dir, not args.no_speaker_id)
+        print("Indexing podcasts only from database...")
+        stats = index_podcasts()
     elif args.documents_only:
-        print("Indexing documents only...")
-        stats = index_documents(documents_dir)
+        print("Indexing documents only from database...")
+        stats = index_documents()
     else:
-        print("Running full ingestion...")
+        print("Running full ingestion from database...")
         stats = run_full_ingestion(
-            podcasts_dir=podcasts_dir,
-            documents_dir=documents_dir,
-            run_speaker_identification=not args.no_speaker_id,
             run_migration_first=not args.skip_migration,
         )
 
@@ -80,9 +77,7 @@ def cmd_search(args):
 
         # Format metadata
         meta_parts = []
-        if "speaker" in r.metadata and r.metadata["speaker"]:
-            meta_parts.append(f"Speaker: {r.metadata['speaker']}")
-        if "start" in r.metadata and r.metadata["start"]:
+        if "start" in r.metadata and r.metadata["start"] is not None:
             meta_parts.append(f"Time: {r.metadata['start']:.1f}s - {r.metadata.get('end', 0):.1f}s")
         if "page" in r.metadata and r.metadata["page"]:
             meta_parts.append(f"Page: {r.metadata['page']}")
@@ -152,24 +147,9 @@ def main():
         help="Index only documents",
     )
     run_parser.add_argument(
-        "--no-speaker-id",
-        action="store_true",
-        help="Skip speaker identification",
-    )
-    run_parser.add_argument(
         "--skip-migration",
         action="store_true",
         help="Skip database migration",
-    )
-    run_parser.add_argument(
-        "--podcasts-dir",
-        type=str,
-        help="Custom podcasts directory",
-    )
-    run_parser.add_argument(
-        "--documents-dir",
-        type=str,
-        help="Custom documents directory",
     )
     run_parser.set_defaults(func=cmd_run)
 

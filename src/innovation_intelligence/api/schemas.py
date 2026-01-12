@@ -17,10 +17,18 @@ class InsightType(str, Enum):
     HEALTH_STAKE = "health_stake"
 
 
-class DimensionType(str, Enum):
+class TrendDimensionType(str, Enum):
+    """Dimension types for TRENDS."""
     ADOPTION = "adoption"
     EXPECTATION = "expectation"
     PROGRESS = "progress"
+
+
+class StakeDimensionType(str, Enum):
+    """Dimension types for HEALTH STAKES."""
+    CRITICALITY = "criticality"
+    URGENCY = "urgency"
+    ACTIONABILITY = "actionability"
 
 
 class TaskStatus(str, Enum):
@@ -85,9 +93,9 @@ class PodcastEpisodeDB(BaseModel):
     id: int
     podcast_name: str
     episode_title: str
-    audio_path: Optional[str] = None
+    gcs_audio_uri: Optional[str] = None
     audio_url: Optional[str] = None
-    transcript_path: Optional[str] = None
+    gcs_transcript_uri: Optional[str] = None
     episode_date: Optional[datetime] = None
     created_at: datetime
 
@@ -96,12 +104,13 @@ class PodcastEpisodeDB(BaseModel):
 
 
 # ---------------------------------------------------------------------
-# Document Schemas
+# Document Schemas (GCS-first mode)
 # ---------------------------------------------------------------------
 class DocumentUploadResponse(BaseModel):
     id: int
     title: str
-    file_path: str
+    gcs_document_uri: str
+    gcs_transcript_uri: Optional[str] = None
     source_type: Optional[str] = None
     created_at: datetime
 
@@ -110,8 +119,8 @@ class DocumentDB(BaseModel):
     id: int
     title: str
     source_type: Optional[str] = None
-    file_path: str
-    transcript_path: Optional[str] = None
+    gcs_document_uri: str
+    gcs_transcript_uri: Optional[str] = None
     document_date: Optional[datetime] = None
     created_at: datetime
 
@@ -145,7 +154,6 @@ class TranscriptionStatus(BaseModel):
 class IndexingRequest(BaseModel):
     include_podcasts: bool = True
     include_documents: bool = True
-    run_speaker_identification: bool = True
 
 
 class IndexingResponse(BaseModel):
@@ -158,7 +166,6 @@ class IngestionRequest(BaseModel):
     """Request for vector indexing pipeline."""
     podcasts_only: bool = False
     documents_only: bool = False
-    with_speaker_identification: bool = True
 
 
 class IngestionStatusResponse(BaseModel):
@@ -167,6 +174,18 @@ class IngestionStatusResponse(BaseModel):
     task_type: str
     status: TaskStatus
     entity_id: Optional[int] = None
+    error: Optional[str] = None
+    result: Optional[Dict[str, Any]] = None
+
+
+class ProcessingStatusResponse(BaseModel):
+    """Status response for unified processing tasks (download → transcribe → index)."""
+    task_id: str
+    task_type: str  # "podcast_processing" or "document_processing"
+    status: TaskStatus
+    entity_id: int
+    current_stage: Optional[str] = None  # "download", "transcribe", "index", "completed"
+    progress: float = Field(default=0.0, ge=0, le=1)
     error: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
 
@@ -182,8 +201,8 @@ class AnalysisRequest(BaseModel):
     skip_extraction: bool = False
     clustering_only: bool = False
     force_reextract: bool = False
-    macro_similarity_threshold: float = Field(default=0.72, ge=0.0, le=1.0)
-    cluster_similarity_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+    macro_similarity_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    cluster_similarity_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     use_llm_naming: bool = True
     generate_macro_descriptions: bool = False
     continue_on_error: bool = True
@@ -216,8 +235,16 @@ class AnalysisStatusResponse(BaseModel):
 
 class PipelineStatsResponse(BaseModel):
     """Statistics from the analysis pipeline."""
-    podcast_episodes: int = 0
-    documents: int = 0
+    # Pipeline page: Items ready for analysis (NOT analyzed yet)
+    podcast_episodes: int = 0  # Ready but not analyzed
+    podcast_episodes_total: int = 0
+    podcasts_analyzed: int = 0  # NEW: Count of analyzed podcasts
+
+    documents: int = 0  # Ready but not analyzed
+    documents_total: int = 0
+    documents_analyzed: int = 0  # NEW: Count of analyzed documents
+
+    # Insights page stats
     unit_insights: Dict[str, Any] = Field(default_factory=dict)
     macro_insights: Dict[str, Any] = Field(default_factory=dict)
     clusters: Dict[str, Any] = Field(default_factory=dict)
@@ -227,12 +254,25 @@ class PipelineStatsResponse(BaseModel):
 # ---------------------------------------------------------------------
 # Insight Schemas
 # ---------------------------------------------------------------------
+class EvidenceItem(BaseModel):
+    """Evidence item with text and optional metadata."""
+    text: str
+    source_ref: Optional[str] = None
+    similarity_score: Optional[float] = None
+    # Podcast-specific metadata
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+    # Document-specific metadata
+    page: Optional[int] = None
+    section: Optional[str] = None
+
+
 class DimensionResponse(BaseModel):
     id: Optional[int] = None
     dimension_type: str
     value: str
     confidence: Optional[float] = None
-    evidence: List[str] = Field(default_factory=list)
+    evidence: List[EvidenceItem] = Field(default_factory=list)
 
 
 class UnitInsightResponse(BaseModel):
@@ -332,7 +372,7 @@ class PipelineStatistics(BaseModel):
 # ---------------------------------------------------------------------
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=2)
-    top_k: int = Field(default=10, ge=1, le=100)
+    top_k: int = Field(default=3, ge=1, le=100)
     source_type: Optional[str] = None
     include_podcasts: bool = True
     include_documents: bool = True

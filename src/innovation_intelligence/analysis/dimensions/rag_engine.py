@@ -4,29 +4,39 @@ RAG (Retrieval-Augmented Generation) engine for dimension assessment.
 
 This module provides:
 - Semantic search over pgvector-indexed chunks
-- Query enhancement with dimension hints
+- Query enhancement with dimension hints (trend or stake specific)
 - Context formatting for LLM consumption
 - Multi-source retrieval (podcasts + documents)
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from sqlalchemy.orm import Session
 
 from innovation_intelligence.analysis.insights.embedder import embed_text
-from innovation_intelligence.db.repositories.vector_repository import (
-    VectorRepository,
-    SearchResult,
+from innovation_intelligence.llm.tools.trend_dimension_tool import (
+    TrendDimensionType,
+    TREND_DIMENSION_HINTS,
 )
-from innovation_intelligence.llm.tools.dimension_tool import (
-    DimensionType,
-    DIMENSION_HINTS,
+from innovation_intelligence.llm.tools.stake_dimension_tool import (
+    StakeDimensionType,
+    STAKE_DIMENSION_HINTS,
 )
 from innovation_intelligence.logger import get_logger
 
+# Lazy import to avoid circular dependency
+if TYPE_CHECKING:
+    from innovation_intelligence.db.repositories.vector_repository import (
+        VectorRepository,
+        SearchResult,
+    )
+
 log = get_logger(__name__)
+
+# Union type for dimension types
+DimensionType = Union[TrendDimensionType, StakeDimensionType]
 
 
 @dataclass
@@ -35,7 +45,7 @@ class RAGContext:
     Retrieved context with metadata for dimension assessment.
     """
     formatted_text: str
-    chunks: List[SearchResult]
+    chunks: List[Any]  # List[SearchResult] at runtime
     sources: List[str]
     total_chars: int
     query: str
@@ -45,10 +55,10 @@ class RAGContext:
 class RAGEngineConfig:
     """Configuration for RAG retrieval."""
     # Number of chunks to retrieve per query
-    top_k: int = 10
+    top_k: int = 3
 
     # Minimum similarity threshold (0-1)
-    min_similarity: float = 0.3
+    min_similarity: float = 0.6
 
     # Maximum total context length
     max_context_chars: int = 200_000
@@ -87,6 +97,9 @@ class RAGEngine:
             session: SQLAlchemy database session
             config: Optional configuration (uses defaults if None)
         """
+        # Import at runtime to avoid circular dependency
+        from innovation_intelligence.db.repositories.vector_repository import VectorRepository
+
         self.session = session
         self.config = config or RAGEngineConfig()
         self._repo = VectorRepository(session)
@@ -95,7 +108,7 @@ class RAGEngine:
         self,
         query: str,
         *,
-        dimension: Optional[DimensionType] = None,
+        dimension_hints: Optional[str] = None,
         source_filter: Optional[str] = None,
         top_k: Optional[int] = None,
         precomputed_embedding: Optional[List[float]] = None,
@@ -105,7 +118,7 @@ class RAGEngine:
 
         Args:
             query: The search query (typically insight name + description)
-            dimension: Optional dimension to enhance query with hints
+            dimension_hints: Optional hints to append to query for better retrieval
             source_filter: Optional filter to specific source
             top_k: Override default top_k
             precomputed_embedding: Optional pre-computed embedding to reuse
@@ -114,7 +127,7 @@ class RAGEngine:
             RAGContext with formatted text and metadata
         """
         # Enhance query with dimension hints if provided
-        enhanced_query = self._enhance_query(query, dimension)
+        enhanced_query = f"{query} {dimension_hints}" if dimension_hints else query
 
         log.info(f"[RAG] Query: {enhanced_query[:100]}...")
 
@@ -165,6 +178,76 @@ class RAGEngine:
             query=enhanced_query,
         )
 
+    def retrieve_for_trend(
+        self,
+        trend_name: str,
+        trend_description: str,
+        dimension: TrendDimensionType,
+        *,
+        source_filter: Optional[str] = None,
+        precomputed_embedding: Optional[List[float]] = None,
+    ) -> RAGContext:
+        """
+        Retrieve context specifically for assessing a TREND's dimension.
+
+        Args:
+            trend_name: Name of the trend
+            trend_description: Description of the trend
+            dimension: Which trend dimension to assess (adoption/expectation/progress)
+            source_filter: Optional filter to specific source
+            precomputed_embedding: Optional pre-computed embedding from UnitInsight
+
+        Returns:
+            RAGContext optimized for trend dimension assessment
+        """
+        # Build query from trend name + description
+        query = f"{trend_name}. {trend_description}" if trend_description else trend_name
+
+        # Get trend-specific dimension hints
+        hint = TREND_DIMENSION_HINTS.get(dimension, "")
+
+        return self.retrieve_context(
+            query=query,
+            dimension_hints=hint,
+            source_filter=source_filter,
+            precomputed_embedding=precomputed_embedding,
+        )
+
+    def retrieve_for_stake(
+        self,
+        stake_name: str,
+        stake_description: str,
+        dimension: StakeDimensionType,
+        *,
+        source_filter: Optional[str] = None,
+        precomputed_embedding: Optional[List[float]] = None,
+    ) -> RAGContext:
+        """
+        Retrieve context specifically for assessing a HEALTH STAKE's dimension.
+
+        Args:
+            stake_name: Name of the health stake
+            stake_description: Description of the health stake
+            dimension: Which stake dimension to assess (criticality/urgency/actionability)
+            source_filter: Optional filter to specific source
+            precomputed_embedding: Optional pre-computed embedding from UnitInsight
+
+        Returns:
+            RAGContext optimized for stake dimension assessment
+        """
+        # Build query from stake name + description
+        query = f"{stake_name}. {stake_description}" if stake_description else stake_name
+
+        # Get stake-specific dimension hints
+        hint = STAKE_DIMENSION_HINTS.get(dimension, "")
+
+        return self.retrieve_context(
+            query=query,
+            dimension_hints=hint,
+            source_filter=source_filter,
+            precomputed_embedding=precomputed_embedding,
+        )
+
     def retrieve_for_insight(
         self,
         insight_name: str,
@@ -175,7 +258,9 @@ class RAGEngine:
         precomputed_embedding: Optional[List[float]] = None,
     ) -> RAGContext:
         """
-        Retrieve context specifically for assessing an insight's dimension.
+        Retrieve context for assessing an insight's dimension (generic fallback).
+
+        DEPRECATED: Use retrieve_for_trend() or retrieve_for_stake() instead.
 
         Args:
             insight_name: Name of the insight
@@ -190,42 +275,26 @@ class RAGEngine:
         # Build query from insight name + description
         query = f"{insight_name}. {insight_description}" if insight_description else insight_name
 
+        # Get appropriate hints based on dimension type
+        hint = ""
+        if isinstance(dimension, TrendDimensionType):
+            hint = TREND_DIMENSION_HINTS.get(dimension, "")
+        elif isinstance(dimension, StakeDimensionType):
+            hint = STAKE_DIMENSION_HINTS.get(dimension, "")
+
         return self.retrieve_context(
             query=query,
-            dimension=dimension,
+            dimension_hints=hint,
             source_filter=source_filter,
             precomputed_embedding=precomputed_embedding,
         )
-
-    def _enhance_query(
-        self,
-        query: str,
-        dimension: Optional[DimensionType] = None,
-    ) -> str:
-        """
-        Enhance query with dimension-specific hints.
-
-        Args:
-            query: Base query text
-            dimension: Optional dimension for hints
-
-        Returns:
-            Enhanced query string
-        """
-        if dimension is None:
-            return query
-
-        hint = DIMENSION_HINTS.get(dimension, "")
-        if hint:
-            return f"{query} {hint}"
-        return query
 
     def _search_chunks(
         self,
         query_embedding: List[float],
         source_filter: Optional[str],
         top_k: int,
-    ) -> List[SearchResult]:
+    ) -> List[Any]:  # List["SearchResult"] at runtime
         """
         Search for relevant chunks across configured sources.
 
@@ -237,7 +306,7 @@ class RAGEngine:
         Returns:
             Combined list of search results
         """
-        results: List[SearchResult] = []
+        results: List[Any] = []  # List[SearchResult] at runtime
 
         if self.config.include_podcasts:
             podcast_results = self._repo.search_podcast_chunks(
@@ -263,8 +332,8 @@ class RAGEngine:
 
     def _deduplicate_chunks(
         self,
-        chunks: List[SearchResult],
-    ) -> List[SearchResult]:
+        chunks: List[Any],  # List[SearchResult] at runtime
+    ) -> List[Any]:  # List["SearchResult"] at runtime
         """
         Remove near-duplicate chunks based on text similarity.
 
@@ -279,7 +348,7 @@ class RAGEngine:
         if not chunks:
             return chunks
 
-        unique: List[SearchResult] = []
+        unique: List[Any] = []  # List[SearchResult] at runtime
 
         for chunk in chunks:
             is_dup = False
@@ -309,7 +378,7 @@ class RAGEngine:
 
         return unique
 
-    def _format_chunks(self, chunks: List[SearchResult]) -> str:
+    def _format_chunks(self, chunks: List[Any]) -> str:  # List[SearchResult] at runtime
         """
         Format chunks into a context string for LLM consumption.
 
@@ -335,7 +404,7 @@ class RAGEngine:
 
         return "\n\n".join(formatted_parts)
 
-    def _format_chunk_header(self, chunk: SearchResult) -> str:
+    def _format_chunk_header(self, chunk: Any) -> str:  # SearchResult at runtime
         """
         Format the header line for a chunk.
 

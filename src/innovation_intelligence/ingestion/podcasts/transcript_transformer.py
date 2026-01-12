@@ -4,7 +4,6 @@ Transcript transformer module for podcast episodes.
 
 Handles:
 - Loading transcript JSON files
-- Applying speaker identification to replace speaker IDs with names
 - Saving transformed transcripts
 """
 from __future__ import annotations
@@ -15,10 +14,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from innovation_intelligence.logger import get_logger
-from innovation_intelligence.llm.tools.speaker_identification_tool import (
-    identify_speakers_from_file,
-    SpeakerIdentificationResult,
-)
 
 log = get_logger(__name__)
 
@@ -29,16 +24,18 @@ class TransformedTranscript:
     episode_title: str
     original_path: Path
     segments: List[Dict[str, Any]]
-    speaker_map: Dict[str, str]
     metadata: Dict[str, Any]
 
 
 def load_transcript(file_path: Path) -> Dict[str, Any]:
     """
-    Load a transcript JSON file.
+    Load a transcript JSON file from local filesystem.
+
+    NOTE: This function is for CLI/testing with local files only.
+    For production use with GCS, use load_transcript_from_gcs() or GCS service directly.
 
     Args:
-        file_path: Path to the transcript JSON
+        file_path: Path to the LOCAL transcript JSON file
 
     Returns:
         Full transcript data dictionary
@@ -47,75 +44,38 @@ def load_transcript(file_path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
-def apply_speaker_mapping(
-    segments: List[Dict[str, Any]],
-    speaker_map: Dict[str, str],
-) -> List[Dict[str, Any]]:
+def load_transcript_from_gcs(gcs_uri: str) -> Dict[str, Any]:
     """
-    Apply speaker name mapping to transcript segments.
-
-    Replaces 'speaker' field values with identified names.
-    Adds 'speaker_name' field while preserving original 'speaker' as 'speaker_id'.
+    Load a transcript JSON file from GCS (GCS-first production use).
 
     Args:
-        segments: List of segment dictionaries
-        speaker_map: Mapping from speaker_id to speaker_name
+        gcs_uri: GCS URI (gs://bucket/podcasts/transcripts/episode.json)
 
     Returns:
-        Transformed segments with speaker names
+        Full transcript data dictionary
     """
-    transformed = []
+    from innovation_intelligence.ingestion.gcs_service import GCSStorageService
 
-    for seg in segments:
-        new_seg = seg.copy()
-
-        # Get original speaker ID
-        speaker_id = seg.get("speaker", "UNKNOWN")
-
-        # Add speaker_name (resolved name)
-        speaker_name = speaker_map.get(speaker_id, speaker_id)
-        new_seg["speaker_name"] = speaker_name
-
-        # Keep original speaker as speaker_id for reference
-        new_seg["speaker_id"] = speaker_id
-
-        # Update the main 'speaker' field to use the name
-        new_seg["speaker"] = speaker_name
-
-        # Also update words if present (WhisperX format)
-        if "words" in new_seg:
-            new_words = []
-            for word in new_seg["words"]:
-                new_word = word.copy()
-                word_speaker_id = word.get("speaker", speaker_id)
-                new_word["speaker_id"] = word_speaker_id
-                new_word["speaker"] = speaker_map.get(word_speaker_id, word_speaker_id)
-                new_words.append(new_word)
-            new_seg["words"] = new_words
-
-        transformed.append(new_seg)
-
-    return transformed
+    gcs_service = GCSStorageService()
+    return gcs_service.read_json(gcs_uri)
 
 
 def transform_transcript(
     transcript_path: Path,
     episode_title: Optional[str] = None,
-    *,
-    speaker_map: Optional[Dict[str, str]] = None,
-    run_identification: bool = True,
 ) -> TransformedTranscript:
     """
-    Transform a transcript by identifying and replacing speaker IDs.
+    Transform a transcript for processing (local file only).
+
+    NOTE: This function is for CLI/testing with local files only.
+    For production use with GCS, use transform_transcript_from_gcs().
 
     Args:
-        transcript_path: Path to the transcript JSON
+        transcript_path: Path to the LOCAL transcript JSON file
         episode_title: Episode title (uses filename if not provided)
-        speaker_map: Pre-computed speaker mapping (skips identification if provided)
-        run_identification: Whether to run speaker identification (default True)
 
     Returns:
-        TransformedTranscript with updated segments
+        TransformedTranscript with segments
     """
     transcript_path = Path(transcript_path)
 
@@ -134,24 +94,8 @@ def transform_transcript(
             episode_title=episode_title,
             original_path=transcript_path,
             segments=[],
-            speaker_map={},
             metadata=data,
         )
-
-    # Get or compute speaker mapping
-    if speaker_map is None and run_identification:
-        log.info(f"[TRANSFORM] Running speaker identification for: {episode_title}")
-        result = identify_speakers_from_file(transcript_path, episode_title)
-        speaker_map = result.speaker_map
-    elif speaker_map is None:
-        # No identification, create identity mapping
-        unique_speakers = set(seg.get("speaker", "UNKNOWN") for seg in segments)
-        speaker_map = {s: s for s in unique_speakers}
-
-    log.info(f"[TRANSFORM] Speaker map: {speaker_map}")
-
-    # Apply mapping
-    transformed_segments = apply_speaker_mapping(segments, speaker_map)
 
     # Preserve other metadata from original transcript
     metadata = {k: v for k, v in data.items() if k != "segments"}
@@ -159,8 +103,53 @@ def transform_transcript(
     return TransformedTranscript(
         episode_title=episode_title,
         original_path=transcript_path,
-        segments=transformed_segments,
-        speaker_map=speaker_map,
+        segments=segments,
+        metadata=metadata,
+    )
+
+
+def transform_transcript_from_gcs(
+    gcs_uri: str,
+    episode_title: str,
+) -> TransformedTranscript:
+    """
+    Transform a transcript from GCS for processing (GCS-first production use).
+
+    Args:
+        gcs_uri: GCS URI (gs://bucket/podcasts/transcripts/episode.json)
+        episode_title: Episode title (required)
+
+    Returns:
+        TransformedTranscript with segments
+
+    Example:
+        transformed = transform_transcript_from_gcs(
+            gcs_uri="gs://bucket/podcasts/transcripts/episode_123.json",
+            episode_title="Huberman Lab - Episode 123"
+        )
+    """
+    log.info(f"[TRANSFORM] Loading transcript from GCS: {gcs_uri}")
+
+    # Load transcript from GCS
+    data = load_transcript_from_gcs(gcs_uri)
+    segments = data.get("segments", [])
+
+    if not segments:
+        log.warning(f"[TRANSFORM] No segments in {gcs_uri}")
+        return TransformedTranscript(
+            episode_title=episode_title,
+            original_path=Path(gcs_uri),  # Store GCS URI as path for reference
+            segments=[],
+            metadata=data,
+        )
+
+    # Preserve other metadata from original transcript
+    metadata = {k: v for k, v in data.items() if k != "segments"}
+
+    return TransformedTranscript(
+        episode_title=episode_title,
+        original_path=Path(gcs_uri),  # Store GCS URI as path for reference
+        segments=segments,
         metadata=metadata,
     )
 
@@ -186,7 +175,6 @@ def save_transformed_transcript(
     output_data = {
         **transformed.metadata,
         "episode_title": transformed.episode_title,
-        "speaker_map": transformed.speaker_map,
         "segments": transformed.segments,
     }
 
@@ -201,8 +189,6 @@ def transform_and_save(
     transcript_path: Path,
     output_dir: Path,
     episode_title: Optional[str] = None,
-    *,
-    speaker_map: Optional[Dict[str, str]] = None,
 ) -> Path:
     """
     Transform a transcript and save to output directory.
@@ -211,7 +197,6 @@ def transform_and_save(
         transcript_path: Path to the input transcript
         output_dir: Directory for output files
         episode_title: Episode title (optional)
-        speaker_map: Pre-computed speaker mapping (optional)
 
     Returns:
         Path to the saved transformed transcript
@@ -219,10 +204,9 @@ def transform_and_save(
     transformed = transform_transcript(
         transcript_path,
         episode_title,
-        speaker_map=speaker_map,
     )
 
-    output_path = Path(output_dir) / f"{transformed.original_path.stem}_identified.json"
+    output_path = Path(output_dir) / f"{transformed.original_path.stem}_transformed.json"
     return save_transformed_transcript(transformed, output_path)
 
 

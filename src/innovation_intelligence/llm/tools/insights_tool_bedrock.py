@@ -1,5 +1,6 @@
+# src/innovation_intelligence/llm/tools/insights_tool.py
 """
-Health insight extraction from transcripts using Gemini tool-use.
+Health insight extraction from transcripts using Claude tool-use.
 
 This module handles:
 - Chunking long transcripts to process full content
@@ -8,14 +9,13 @@ This module handles:
 """
 from __future__ import annotations
 
-import time
+import json
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from google.genai import types
-
-from innovation_intelligence.llm.gemini_client import GeminiClient
+from innovation_intelligence.llm.bedrock_client import BedrockClient
 from innovation_intelligence.logger import get_logger
 from innovation_intelligence.config import settings
 
@@ -25,18 +25,23 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------
+# Max characters per chunk (leaving room for prompt overhead)
+# ~100K chars ≈ 25K tokens, safe for Claude's context window
 DEFAULT_CHUNK_SIZE = 250_000
 DEFAULT_CHUNK_OVERLAP = 2_000  # Overlap to avoid cutting insights
 
-# Insight extraction limits per chunk
-MIN_INSIGHTS_PER_CHUNK = 1
-MAX_INSIGHTS_PER_CHUNK = 10
-TARGET_INSIGHTS_PER_CHUNK = "1-10"
+
+@dataclass
+class RawInsight:
+    name: str
+    description: str
+    type: str         # "trend" | "health_stake"
+    evidence: str
 
 
-# ---------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Chunking utilities
-# ---------------------------------------------------------------------
+# ----------------------------------------------------------------------
 def chunk_text(
     text: str,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
@@ -99,7 +104,7 @@ def deduplicate_insights(
 
     Args:
         insights: List of insight dictionaries
-        similarity_threshold: Minimum cosine similarity to consider duplicate (default 0.90)
+        similarity_threshold: Minimum cosine similarity to consider duplicate (default 0.75)
 
     Returns:
         Deduplicated list of insights
@@ -166,101 +171,66 @@ def deduplicate_insights(
 
 
 # ----------------------------------------------------------------------
-# Tool definition (Gemini format)
+# Tool definition & payload
 # ----------------------------------------------------------------------
-def _create_tool_function(
-    name: str,
-    description: str,
-    schema: Dict[str, Any]
-) -> types.Tool:
-    """
-    Helper to convert a JSON schema to a Gemini types.Tool object.
-    """
-    function_declaration = types.FunctionDeclaration(
-        name=name,
-        description=description,
-        parameters=types.Schema(**schema),
-    )
-
-    return types.Tool(
-        function_declarations=[function_declaration]
-    )
-
-
-def create_extract_health_insights_tool() -> types.Tool:
+def create_extract_health_insights_tool() -> Dict[str, Any]:
     """
     Tool definition for extracting health trends and stakes from transcripts.
-    Includes schema constraints for insight count (minItems/maxItems).
     """
-    schema = {
-        "type": "object",
-        "properties": {
-            "filename": {
-                "type": "string",
-                "description": "Transcript identifier (no extension).",
-            },
-            "insights": {
-                "type": "array",
+    return {
+        "tools": [
+            {
+                "name": "extract_health_insights",
                 "description": (
-                    f"List of {TARGET_INSIGHTS_PER_CHUNK} most significant health "
-                    "trends and stakes, ranked by importance. Focus on quality over "
-                    "quantity - include only insights with clear textual evidence."
+                    "Extract ALL key health-related trends and health stakes "
+                    "from a transcript. Each item includes name, description, type, evidence."
                 ),
-                "minItems": MIN_INSIGHTS_PER_CHUNK,
-                "maxItems": MAX_INSIGHTS_PER_CHUNK,
-                "items": {
+                "input_schema": {
                     "type": "object",
                     "properties": {
-                        "name": {
+                        "filename": {
                             "type": "string",
-                            "description": "Concise label (3-8 words) using transcript terminology.",
+                            "description": "Transcript identifier (no extension).",
                         },
-                        "description": {
-                            "type": "string",
-                            "description": "20-30 word summary grounded in the transcript.",
+                        "insights": {
+                            "type": "array",
+                            "description": "List of extracted health trends and stakes.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {
+                                        "type": "string",
+                                        "description": "Concise label (3-8 words) using transcript terminology.",
+                                    },
+                                    "description": {
+                                        "type": "string",
+                                        "description": "20-30 word summary grounded in the transcript.",
+                                    },
+                                    "type": {
+                                        "type": "string",
+                                        "enum": ["trend", "health_stake"],
+                                    },
+                                    "evidence": {
+                                        "type": "string",
+                                        "description": "Short note on where/how this appears in the transcript.",
+                                    },
+                                },
+                                "required": ["name", "description", "type", "evidence"],
+                            },
                         },
-                        "type": {
+                        "extraction_notes": {
                             "type": "string",
-                            "enum": ["trend", "health_stake"],
-                            "description": (
-                                "'trend' = consistent pattern of change over time; "
-                                "'health_stake' = critical risk, issue, or opportunity."
-                            ),
-                        },
-                        "evidence": {
-                            "type": "string",
-                            "description": "Short note on where/how this appears in the transcript.",
+                            "description": "Short explanation of selection criteria or ambiguities.",
                         },
                     },
-                    "required": ["name", "description", "type", "evidence"],
+                    "required": ["filename", "insights"],
                 },
-            },
-            "extraction_notes": {
-                "type": "string",
-                "description": (
-                    "Brief explanation of selection criteria, any ambiguities, "
-                    "or notable omissions (insights that were borderline)."
-                ),
-            },
-        },
-        "required": ["filename", "insights"],
+            }
+        ],
+        "tool_choice": {"type": "tool", "name": "extract_health_insights"},
     }
 
-    return _create_tool_function(
-        name="extract_health_insights",
-        description=(
-            f"Extract the {TARGET_INSIGHTS_PER_CHUNK} most significant health-related "
-            "trends and health stakes from a transcript. Prioritize by: frequency of "
-            "mention, explicit emphasis, and clinical/strategic importance. "
-            "Each item includes name, description, type, and evidence."
-        ),
-        schema=schema,
-    )
 
-
-# ----------------------------------------------------------------------
-# Payload building
-# ----------------------------------------------------------------------
 def build_insights_payload(
     *,
     filename: str,
@@ -269,7 +239,7 @@ def build_insights_payload(
     total_chunks: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Build the arguments for Gemini insight extraction.
+    Build the API payload for insight extraction.
 
     Args:
         filename: Transcript identifier
@@ -278,46 +248,34 @@ def build_insights_payload(
         total_chunks: Total number of chunks
 
     Returns:
-        Dict with keys: contents, tool_defs, system_instruction
+        Complete API payload dict
     """
-    extract_tool = create_extract_health_insights_tool()
+    tools_cfg = create_extract_health_insights_tool()
 
-    system_instruction = f"""You are a health policy analyst specializing in identifying significant trends and strategic health stakes from medical and public health documents.
+    system_prompt = """You are a health policy analyst specializing in identifying significant trends and strategic health stakes from medical and public health documents.
 
 Your extraction approach:
-- Extract the {TARGET_INSIGHTS_PER_CHUNK} most significant insights from the text
-- Prioritize items by: (1) frequency of mention, (2) explicit emphasis by speakers, (3) clinical/strategic significance
+- Prioritize items with clear evidence of importance (repetition, explicit emphasis, clinical significance)
 - Use precise, domain-specific terminology from the source material
 - Distinguish between evolving patterns (trends) and critical risks/opportunities (health stakes)
-- Ground every extraction in explicit textual evidence
-
-Quality guidelines:
-- Prefer fewer, high-quality insights over many weak ones
-- Each insight must have clear textual support
-- Avoid overly generic or vague insights
-- Skip insights that lack concrete evidence in the transcript"""
+- Ground every extraction in explicit textual evidence"""
 
     # Add chunk context if processing in parts
     chunk_context = ""
     if chunk_index is not None and total_chunks is not None and total_chunks > 1:
-        chunk_context = f"""
-
-Note: This is part {chunk_index} of {total_chunks} of the full transcript.
-- Extract insights from THIS SECTION only
-- Maintain the same quality standards regardless of chunk position
-- Later chunks may contain follow-up discussion of earlier topics"""
+        chunk_context = f"\n\nNote: This is part {chunk_index} of {total_chunks} of the full transcript. Extract insights from this section only."
 
     user_prompt = f"""Analyze this health-related transcript and extract the most significant insights.
 
 Definitions:
-- Health Stake: Critical issue, risk, or opportunity that affects health outcomes (e.g., emerging disease threats, healthcare access gaps, regulatory changes).
-- Trend: Consistent, observable pattern of change over time (e.g., rising obesity rates, shift toward telemedicine, declining vaccination uptake).
+- Health Stake: critical issue, risk, or opportunity that affects health outcomes.
+- Trend: consistent, observable pattern of change over time.
 
 Task:
-1. Identify the {TARGET_INSIGHTS_PER_CHUNK} most significant insights (trends and health stakes) in this text
-2. Rank by importance: frequency of mention, explicit emphasis, clinical/strategic significance
-3. Use precise terminology from the transcript
-4. Translate insights to English if the source transcript is in another language
+- Identify ALL key insights (trends and health stakes) in this text.
+- Use precise terminology from the transcript.
+- Base everything strictly on the transcript content.
+- Translate insights in english is the source transcript is in another language
 {chunk_context}
 
 Filename: {filename}
@@ -325,42 +283,51 @@ Filename: {filename}
 Transcript:
 {transcript_text}
 
-Call the extract_health_insights function with your analysis. Focus on quality over quantity."""
-
-    contents = [user_prompt]
+Call the extract_health_insights tool with your analysis.
+"""
 
     return {
-        "contents": contents,
-        "tool_defs": [extract_tool],
-        "system_instruction": system_instruction,
+        "anthropic_version": "bedrock-2023-05-31",
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_prompt}],
+        "tools": tools_cfg["tools"],
+        "tool_choice": tools_cfg["tool_choice"],
+        "max_tokens": 4096,
+        "temperature": 0.2,
     }
 
 
 # ----------------------------------------------------------------------
 # Response parsing
 # ----------------------------------------------------------------------
-def parse_insights_tool_response(response: types.GenerateContentResponse) -> Dict[str, Any]:
+def parse_insights_tool_response(response: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Extract the tool input from Gemini's function call response.
+    Extract the tool input from Claude's tool_use response.
     Returns the dict with keys: filename, insights, extraction_notes?
     """
-    if not response.function_calls:
-        # Check for text response (model didn't use tool)
-        if response.text:
-            snippet = response.text[:200]
-            log.warning(f"[INSIGHTS] Model returned text instead of function call: {snippet}...")
-        raise ValueError("No function call found in response")
+    if "error" in response:
+        msg = response.get("error", {}).get("message", "Unknown error")
+        raise ValueError(f"API error: {msg}")
 
-    call = response.function_calls[0]
+    content = response.get("content", [])
+    if not content:
+        raise ValueError("Empty response content")
 
-    if call.name != "extract_health_insights":
-        raise ValueError(f"Unexpected function call: {call.name}")
+    tool_blocks = [b for b in content if b.get("type") == "tool_use"]
+    if not tool_blocks:
+        # log text content for debugging
+        text_blocks = [b for b in content if b.get("type") == "text"]
+        if text_blocks:
+            snippet = text_blocks[0].get("text", "")[:200]
+            log.warning(f"[INSIGHTS] Model returned text instead of tool_use: {snippet}...")
+        raise ValueError("No tool_use block found in response")
 
-    # Convert to dict
-    tool_input = dict(call.args)
+    tool_block = tool_blocks[0]
+    tool_input = tool_block.get("input", {}) or {}
 
-    insights = tool_input.get("insights", [])
-    log.info("[INSIGHTS] Tool returned %d insights", len(insights))
+    if tool_block.get("name") == "extract_health_insights":
+        insights = tool_input.get("insights", [])
+        log.info(f"[INSIGHTS] Tool returned {len(insights)} insights")
 
     return tool_input
 
@@ -371,29 +338,22 @@ def parse_insights_tool_response(response: types.GenerateContentResponse) -> Dic
 def _extract_from_chunk(
     transcript_text: str,
     filename: str,
-    client: GeminiClient,
+    client: BedrockClient,
     chunk_index: Optional[int] = None,
     total_chunks: Optional[int] = None,
-    retry_attempts: int = 3,
-    backoff: float = 2.0,
 ) -> Dict[str, Any]:
     """
-    Extract insights from a single chunk of text with retry logic.
+    Extract insights from a single chunk of text.
 
     Args:
         transcript_text: Chunk text
         filename: Transcript identifier
-        client: Gemini client
+        client: Bedrock client
         chunk_index: Current chunk (1-indexed)
         total_chunks: Total chunks
-        retry_attempts: Number of retry attempts for parsing failures
-        backoff: Base wait time between retries (in seconds)
 
     Returns:
         Parsed tool output dict
-
-    Raises:
-        ValueError: After all retry attempts fail
     """
     payload = build_insights_payload(
         filename=filename,
@@ -401,45 +361,8 @@ def _extract_from_chunk(
         chunk_index=chunk_index,
         total_chunks=total_chunks,
     )
-
-    last_error = None
-
-    for attempt in range(1, retry_attempts + 1):
-        try:
-            response = client.invoke(
-                contents=payload["contents"],
-                tool_defs=payload["tool_defs"],
-                system_instruction=payload["system_instruction"],
-                allowed_function_names=["extract_health_insights"],
-            )
-
-            return parse_insights_tool_response(response)
-
-        except ValueError as e:
-            last_error = e
-            error_msg = str(e)
-
-            if attempt == retry_attempts:
-                log.error(
-                    "[INSIGHTS] All %d attempts failed for chunk %s: %s",
-                    retry_attempts,
-                    chunk_index or "single",
-                    error_msg
-                )
-                raise
-
-            wait_time = backoff * attempt
-            log.warning(
-                "[INSIGHTS] Attempt %d/%d failed: %s. Retrying in %.1fs...",
-                attempt,
-                retry_attempts,
-                error_msg,
-                wait_time
-            )
-            time.sleep(wait_time)
-
-    # Should never reach here, but just in case
-    raise last_error or ValueError("Extraction failed unexpectedly")
+    response = client.invoke(payload)
+    return parse_insights_tool_response(response)
 
 
 # ----------------------------------------------------------------------
@@ -449,11 +372,9 @@ def extract_health_insights_from_text(
     transcript_text: str,
     *,
     filename: str,
-    client: GeminiClient | None = None,
+    client: BedrockClient | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
-    retry_attempts: int = 3,
-    backoff: float = 2.0,
 ) -> Dict[str, Any]:
     """
     Extract health insights from transcript text.
@@ -464,19 +385,17 @@ def extract_health_insights_from_text(
     Args:
         transcript_text: Full transcript text
         filename: Transcript identifier
-        client: Optional pre-configured GeminiClient
+        client: Optional pre-configured BedrockClient
         chunk_size: Max characters per chunk
         chunk_overlap: Overlap between chunks
-        retry_attempts: Number of retry attempts for each chunk extraction
-        backoff: Base wait time between retries (in seconds)
 
     Returns:
         Dict with keys: filename, insights, extraction_notes
     """
-    client = client or GeminiClient(
-        project=settings.gcp.project_id,
-        location=settings.gcp.location,
-        model_id=settings.gcp.gemini_model_id,
+    client = client or BedrockClient(
+        model_id=settings.aws.bedrock_model_id,
+        region=settings.aws.region,
+        profile=settings.aws.profile,
     )
 
     # Chunk the text
@@ -499,8 +418,6 @@ def extract_health_insights_from_text(
                 client=client,
                 chunk_index=i if len(chunks) > 1 else None,
                 total_chunks=len(chunks) if len(chunks) > 1 else None,
-                retry_attempts=retry_attempts,
-                backoff=backoff,
             )
 
             chunk_insights = result.get("insights", [])
@@ -515,8 +432,8 @@ def extract_health_insights_from_text(
             )
 
         except Exception as e:
-            log.error("[INSIGHTS] Failed to process chunk %d after %d retries: %s", i, retry_attempts, e)
-            all_notes.append(f"[Chunk {i}] Error after {retry_attempts} retries: {str(e)}")
+            log.error("[INSIGHTS] Failed to process chunk %d: %s", i, e)
+            all_notes.append(f"[Chunk {i}] Error: {str(e)}")
 
     # Deduplicate if we had multiple chunks
     if len(chunks) > 1:

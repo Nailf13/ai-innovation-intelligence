@@ -1,13 +1,12 @@
 # src/innovation_intelligence/ingestion/podcasts/pipeline.py
 """
-Production-ready podcast ingestion pipeline.
+Production-ready podcast ingestion pipeline using Google Speech API (Chirp).
 
 Orchestrates the full ingestion workflow:
 1. Episode discovery and selection
-2. Audio downloading (with optional trimming)
-3. Transcription via Modal GPU
-4. Speaker identification
-5. Vector indexing
+2. Audio downloading (with optional trimming) and upload to GCS
+3. Transcription via Google Speech API (Chirp)
+4. Vector indexing
 
 Designed for frontend integration where users can:
 - Search podcasts and select episodes
@@ -19,6 +18,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Any
+import json
 
 from innovation_intelligence.config import settings
 from innovation_intelligence.logger import get_logger
@@ -43,14 +43,8 @@ from innovation_intelligence.ingestion.podcasts.services import (
 # Repository
 from innovation_intelligence.db.repositories.episode_repository import EpisodeRepository
 
-# Transcript transformation (speaker identification)
-from innovation_intelligence.ingestion.podcasts.transcript_transformer import (
-    transform_transcript,
-    TransformedTranscript,
-)
-
 # Vector indexing
-from innovation_intelligence.chunking.podcast_chunker import (
+from innovation_intelligence.ingestion.podcasts.podcast_chunker import (
     PodcastChunker,
 )
 from innovation_intelligence.analysis.insights.embedder import embed_texts_batch
@@ -67,6 +61,10 @@ ProgressCallback = Callable[[IngestionStage, IngestionStatus, str, float], None]
 class PodcastIngestionPipeline:
     """
     Production-ready pipeline for ingesting podcast episodes.
+
+    Uses Google Cloud services:
+    - GCS for audio and transcript storage
+    - Google Speech API (Chirp) for transcription
 
     Supports:
     - Batch ingestion of multiple episodes
@@ -91,24 +89,20 @@ class PodcastIngestionPipeline:
     def __init__(
         self,
         session=None,
-        audio_dir: Optional[Path] = None,
-        transcripts_dir: Optional[Path] = None,
-        use_modal: bool = True,
         progress_callback: Optional[ProgressCallback] = None,
+        language_codes: Optional[List[str]] = None,
     ):
         # Session management
         self._session = session
         self._owns_session = session is None
 
-        # Directories
-        self.audio_dir = audio_dir or settings.paths.audio_dir
-        self.transcripts_dir = transcripts_dir or settings.paths.transcripts_dir
+        # Language codes for transcription
+        self.language_codes = language_codes or ["en-US"]
 
-        # Services
-        self.download_service = AudioDownloadService(output_dir=self.audio_dir)
+        # Services (GCS-first mode)
+        self.download_service = AudioDownloadService()
         self.transcription_service = TranscriptionService(
-            output_dir=self.transcripts_dir,
-            use_modal=use_modal,
+            language_codes=self.language_codes,
         )
         self.search_service = PodcastSearchService()
         self.chunker = PodcastChunker()
@@ -180,7 +174,6 @@ class PodcastIngestionPipeline:
                 episode=episode,
                 podcast_info=request.podcast_info,
                 skip_existing=skip_existing,
-                skip_speaker_identification=request.skip_speaker_identification,
                 skip_indexing=request.skip_indexing,
                 trim_audio_seconds=request.trim_audio_seconds,
             )
@@ -205,7 +198,6 @@ class PodcastIngestionPipeline:
         relevance_keywords: Optional[List[str]] = None,
         min_relevance_score: float = 0.0,
         skip_existing: bool = True,
-        skip_speaker_identification: bool = False,
         skip_indexing: bool = False,
         trim_audio_seconds: int = 0,
     ) -> IngestionBatchResult:
@@ -218,7 +210,6 @@ class PodcastIngestionPipeline:
             relevance_keywords: Keywords for filtering relevant episodes
             min_relevance_score: Minimum relevance score (0.0-1.0)
             skip_existing: Skip episodes already in database
-            skip_speaker_identification: Skip speaker ID stage
             skip_indexing: Skip vector indexing stage
             trim_audio_seconds: Seconds to trim from audio start
 
@@ -258,7 +249,6 @@ class PodcastIngestionPipeline:
         request = IngestionRequest(
             episodes=episodes,
             podcast_info=podcast_info,
-            skip_speaker_identification=skip_speaker_identification,
             skip_indexing=skip_indexing,
             trim_audio_seconds=trim_audio_seconds,
         )
@@ -273,12 +263,16 @@ class PodcastIngestionPipeline:
         episode: EpisodeInfo,
         podcast_info: Optional[PodcastInfo] = None,
         skip_existing: bool = True,
-        skip_speaker_identification: bool = False,
         skip_indexing: bool = False,
         trim_audio_seconds: int = 0,
     ) -> EpisodeIngestionResult:
         """
         Ingest a single episode through all pipeline stages.
+
+        Stages:
+        1. Download audio and upload to GCS
+        2. Transcribe using Google Speech API (Chirp)
+        3. Vector indexing (optional)
 
         Returns:
             EpisodeIngestionResult with status and metadata
@@ -307,27 +301,27 @@ class PodcastIngestionPipeline:
                 return result
 
             # ---------------------------------------------------------
-            # Stage 1: Download
+            # Stage 1: Download and Upload to GCS (GCS-first mode)
             # ---------------------------------------------------------
             result.status = IngestionStatus.DOWNLOADING
             self._report_progress(
                 IngestionStage.DOWNLOAD,
                 IngestionStatus.DOWNLOADING,
-                f"Downloading: {episode.title[:50]}...",
+                f"Downloading and uploading to GCS: {episode.title[:50]}...",
                 10.0,
             )
 
             try:
-                if trim_audio_seconds > 0:
-                    audio_path = self.download_service.download_and_trim(
-                        episode,
-                        trim_start=trim_audio_seconds,
-                    )
-                else:
-                    audio_path = self.download_service.download(episode)
+                # Download directly to GCS (uses temporary files only for trimming)
+                gcs_audio_uri = self.download_service.download_to_gcs(
+                    episode,
+                    trim_start=trim_audio_seconds,
+                )
 
-                result.audio_path = audio_path
                 result.status = IngestionStatus.DOWNLOADED
+                result.gcs_audio_uri = gcs_audio_uri
+                log.info(f"[INGEST] Audio uploaded to GCS: {gcs_audio_uri}")
+
             except Exception as e:
                 result.status = IngestionStatus.FAILED
                 result.error_stage = IngestionStage.DOWNLOAD
@@ -337,43 +331,43 @@ class PodcastIngestionPipeline:
                 return result
 
             # ---------------------------------------------------------
-            # Create DB entry
+            # Create DB entry (GCS-first: only GCS URIs stored)
             # ---------------------------------------------------------
             db_episode, created = repo.get_or_create(
                 podcast_name=podcast_name,
                 episode_title=episode.title,
                 audio_url=episode.audio_url,
-                audio_path=audio_path,
                 episode_date=episode.published_at,
+                gcs_audio_uri=gcs_audio_uri,
             )
             result.db_episode_id = db_episode.id
 
             if not created:
-                # Update audio path if needed
-                repo.update_audio_path(db_episode.id, str(audio_path))
+                # Update GCS URI if needed
+                repo.update_gcs_uris(db_episode.id, gcs_audio_uri=gcs_audio_uri)
 
             # ---------------------------------------------------------
-            # Stage 2: Transcription
+            # Stage 2: Transcription (GCS-first mode)
             # ---------------------------------------------------------
             result.status = IngestionStatus.TRANSCRIBING
             self._report_progress(
                 IngestionStage.TRANSCRIBE,
                 IngestionStatus.TRANSCRIBING,
-                f"Transcribing: {episode.title[:50]}...",
+                f"Transcribing with Chirp from GCS: {episode.title[:50]}...",
                 30.0,
             )
 
             try:
-                transcript_path = self.transcription_service.transcribe(
-                    audio_path=audio_path,
+                # Transcribe from GCS using Chirp (returns GCS URI)
+                gcs_transcript_uri = self.transcription_service.transcribe_from_gcs(
+                    gcs_audio_uri=gcs_audio_uri,
                     episode=episode,
-                    db_episode_id=db_episode.id,
                 )
-                result.transcript_path = transcript_path
                 result.status = IngestionStatus.TRANSCRIBED
+                result.gcs_transcript_uri = gcs_transcript_uri
 
-                # Update DB with transcript path
-                repo.update_transcript_path(db_episode.id, str(transcript_path))
+                # Update DB with transcript GCS URI
+                repo.update_gcs_uris(db_episode.id, gcs_transcript_uri=gcs_transcript_uri)
 
             except Exception as e:
                 result.status = IngestionStatus.FAILED
@@ -384,36 +378,7 @@ class PodcastIngestionPipeline:
                 return result
 
             # ---------------------------------------------------------
-            # Stage 3: Speaker Identification
-            # ---------------------------------------------------------
-            speaker_map: Dict[str, str] = {}
-
-            if not skip_speaker_identification:
-                result.status = IngestionStatus.IDENTIFYING_SPEAKERS
-                self._report_progress(
-                    IngestionStage.SPEAKER_ID,
-                    IngestionStatus.IDENTIFYING_SPEAKERS,
-                    f"Identifying speakers: {episode.title[:50]}...",
-                    60.0,
-                )
-
-                try:
-                    transformed = transform_transcript(
-                        transcript_path,
-                        episode_title=episode.title,
-                        run_identification=True,
-                    )
-                    speaker_map = transformed.speaker_map
-                    result.speaker_map = speaker_map
-                    result.status = IngestionStatus.SPEAKERS_IDENTIFIED
-
-                except Exception as e:
-                    # Speaker identification failure is not fatal
-                    log.warning(f"[INGEST] Speaker identification failed: {e}")
-                    speaker_map = {}
-
-            # ---------------------------------------------------------
-            # Stage 4: Vector Indexing
+            # Stage 3: Vector Indexing
             # ---------------------------------------------------------
             if not skip_indexing:
                 result.status = IngestionStatus.INDEXING
@@ -421,15 +386,14 @@ class PodcastIngestionPipeline:
                     IngestionStage.INDEX,
                     IngestionStatus.INDEXING,
                     f"Indexing: {episode.title[:50]}...",
-                    80.0,
+                    70.0,
                 )
 
                 try:
                     chunks_indexed = self._index_episode(
-                        transcript_path=transcript_path,
+                        gcs_transcript_uri=gcs_transcript_uri,
                         episode=episode,
                         db_episode_id=db_episode.id,
-                        speaker_map=speaker_map,
                     )
                     result.chunks_indexed = chunks_indexed
                     result.status = IngestionStatus.INDEXED
@@ -465,36 +429,49 @@ class PodcastIngestionPipeline:
     # -----------------------------------------------------------------
     def _index_episode(
         self,
-        transcript_path: Path,
+        gcs_transcript_uri: str,
         episode: EpisodeInfo,
         db_episode_id: int,
-        speaker_map: Optional[Dict[str, str]] = None,
     ) -> int:
         """
-        Index a transcript into the vector database.
+        Index a transcript into the vector database (GCS-first mode).
+
+        Args:
+            gcs_transcript_uri: GCS URI of the transcript
+            episode: Episode info
+            db_episode_id: Database episode ID
 
         Returns:
             Number of chunks indexed
         """
-        from innovation_intelligence.ingestion.podcasts.transcript_transformer import (
-            load_transcript,
-            apply_speaker_mapping,
-        )
+        from innovation_intelligence.db.models import PodcastEpisode
 
-        # Load transcript
-        data = load_transcript(transcript_path)
+        # Load transcript from GCS
+        data = self.transcription_service.get_transcript(gcs_transcript_uri)
+
         segments = data.get("segments", [])
 
         if not segments:
-            log.warning(f"[INDEX] No segments in transcript: {transcript_path}")
+            log.warning(f"[INDEX] No segments in transcript: {gcs_transcript_uri}")
             return 0
 
-        # Apply speaker mapping if available
-        if speaker_map:
-            segments = apply_speaker_mapping(segments, speaker_map)
+        # Query database to get podcast_name and episode_title for proper source formatting
+        db_episode = self.session.query(PodcastEpisode).filter(
+            PodcastEpisode.id == db_episode_id
+        ).first()
 
-        # Create source identifier
-        source = transcript_path.stem
+        if db_episode:
+            # Format source as "podcast_name - episode_title"
+            source = f"{db_episode.podcast_name} - {db_episode.episode_title}"
+            podcast_name = db_episode.podcast_name
+            episode_title = db_episode.episode_title
+            log.info(f"[INDEX] Using source from DB: {source}")
+        else:
+            # Fallback to using episode info from RSS feed
+            source = episode.title
+            podcast_name = None
+            episode_title = episode.title
+            log.warning(f"[INDEX] Episode not found in DB, using RSS title as source: {source}")
 
         # Chunk the transcript
         chunks = self.chunker.chunk(
@@ -502,11 +479,11 @@ class PodcastIngestionPipeline:
             source=source,
             episode_date=episode.published_at.isoformat() if episode.published_at else None,
             metadata={
-                "episode_title": episode.title,
+                "podcast_name": podcast_name,
+                "episode_title": episode_title,
                 "episode_id": episode.episode_id,
                 "feed_id": episode.feed_id,
                 "db_episode_id": db_episode_id,
-                "speaker_map": speaker_map or {},
             },
         )
 
@@ -540,9 +517,9 @@ def ingest_podcast(
     podcast_name: str,
     max_episodes: int = 5,
     relevance_keywords: Optional[List[str]] = None,
-    skip_speaker_identification: bool = False,
     skip_indexing: bool = False,
     trim_audio_seconds: int = 0,
+    language_codes: Optional[List[str]] = None,
 ) -> IngestionBatchResult:
     """
     Convenience function to ingest episodes from a podcast.
@@ -551,19 +528,18 @@ def ingest_podcast(
         podcast_name: Name of the podcast
         max_episodes: Maximum episodes to ingest
         relevance_keywords: Keywords for filtering
-        skip_speaker_identification: Skip speaker ID
         skip_indexing: Skip vector indexing
         trim_audio_seconds: Seconds to trim from start
+        language_codes: Language codes for transcription (default: ["en-US"])
 
     Returns:
         IngestionBatchResult
     """
-    with PodcastIngestionPipeline() as pipeline:
+    with PodcastIngestionPipeline(language_codes=language_codes) as pipeline:
         return pipeline.ingest_from_podcast(
             podcast_name=podcast_name,
             max_episodes=max_episodes,
             relevance_keywords=relevance_keywords,
-            skip_speaker_identification=skip_speaker_identification,
             skip_indexing=skip_indexing,
             trim_audio_seconds=trim_audio_seconds,
         )
@@ -572,8 +548,8 @@ def ingest_podcast(
 def ingest_episodes(
     episodes: List[EpisodeInfo],
     podcast_info: Optional[PodcastInfo] = None,
-    skip_speaker_identification: bool = False,
     skip_indexing: bool = False,
+    language_codes: Optional[List[str]] = None,
 ) -> IngestionBatchResult:
     """
     Convenience function to ingest specific episodes.
@@ -581,8 +557,8 @@ def ingest_episodes(
     Args:
         episodes: List of EpisodeInfo objects
         podcast_info: Optional podcast metadata
-        skip_speaker_identification: Skip speaker ID
         skip_indexing: Skip vector indexing
+        language_codes: Language codes for transcription (default: ["en-US"])
 
     Returns:
         IngestionBatchResult
@@ -590,11 +566,10 @@ def ingest_episodes(
     request = IngestionRequest(
         episodes=episodes,
         podcast_info=podcast_info,
-        skip_speaker_identification=skip_speaker_identification,
         skip_indexing=skip_indexing,
     )
 
-    with PodcastIngestionPipeline() as pipeline:
+    with PodcastIngestionPipeline(language_codes=language_codes) as pipeline:
         return pipeline.ingest(request)
 
 
@@ -606,7 +581,7 @@ if __name__ == "__main__":
 
     def print_usage():
         print("""
-Podcast Ingestion Pipeline
+Podcast Ingestion Pipeline (Google Speech API - Chirp)
 
 Usage:
     python pipeline.py <podcast_name> [options]
@@ -614,13 +589,14 @@ Usage:
 Options:
     --max-episodes N        Maximum episodes to ingest (default: 5)
     --trim N                Trim N seconds from audio start (default: 0)
-    --no-speaker-id         Skip speaker identification
     --no-indexing           Skip vector indexing
     --keywords "k1,k2,k3"   Comma-separated relevance keywords
+    --language CODE         Language code for transcription (default: en-US)
 
 Examples:
     python pipeline.py "Huberman Lab" --max-episodes 3
     python pipeline.py "The Peter Attia Drive" --keywords "health,longevity"
+    python pipeline.py "French Podcast" --language fr-FR
 """)
 
     args = sys.argv[1:]
@@ -633,9 +609,9 @@ Examples:
     podcast_name = args[0]
     max_episodes = 5
     trim_seconds = 0
-    skip_speaker_id = False
     skip_indexing = False
     keywords: Optional[List[str]] = None
+    language_codes: Optional[List[str]] = None
 
     i = 1
     while i < len(args):
@@ -646,14 +622,14 @@ Examples:
         elif arg == "--trim" and i + 1 < len(args):
             trim_seconds = int(args[i + 1])
             i += 2
-        elif arg == "--no-speaker-id":
-            skip_speaker_id = True
-            i += 1
         elif arg == "--no-indexing":
             skip_indexing = True
             i += 1
         elif arg == "--keywords" and i + 1 < len(args):
             keywords = [k.strip() for k in args[i + 1].split(",")]
+            i += 2
+        elif arg == "--language" and i + 1 < len(args):
+            language_codes = [args[i + 1]]
             i += 2
         else:
             i += 1
@@ -663,15 +639,16 @@ Examples:
     print(f"  Max episodes: {max_episodes}")
     print(f"  Trim seconds: {trim_seconds}")
     print(f"  Keywords: {keywords or 'default health keywords'}")
+    print(f"  Language: {language_codes[0] if language_codes else 'en-US'}")
     print()
 
     result = ingest_podcast(
         podcast_name=podcast_name,
         max_episodes=max_episodes,
         relevance_keywords=keywords,
-        skip_speaker_identification=skip_speaker_id,
         skip_indexing=skip_indexing,
         trim_audio_seconds=trim_seconds,
+        language_codes=language_codes,
     )
 
     print("\n" + "=" * 60)

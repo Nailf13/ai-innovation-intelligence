@@ -5,6 +5,7 @@ Audio download service for podcast episodes.
 Provides:
 - Streaming download with progress
 - Optional audio trimming via ffmpeg
+- Upload to GCS for cloud storage
 - Retry logic and error handling
 """
 from __future__ import annotations
@@ -13,7 +14,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import requests
 
@@ -30,40 +31,43 @@ ProgressCallback = Callable[[int, int], None]  # (downloaded_bytes, total_bytes)
 
 class AudioDownloadService:
     """
-    Service for downloading podcast audio files.
+    Service for downloading podcast audio files with GCS-first storage.
+
+    Downloads audio files directly to GCS. Uses temporary local files only
+    when processing is needed (e.g., trimming with ffmpeg).
 
     Usage:
         service = AudioDownloadService()
-        path = service.download(episode, output_dir)
-        # or with trimming:
-        path = service.download_and_trim(episode, output_dir, trim_start=60)
+
+        # Download and upload to GCS (GCS-first mode)
+        gcs_uri = service.download_to_gcs(episode)
+
+        # Download with trimming (uses temp files)
+        gcs_uri = service.download_to_gcs(episode, trim_start=60)
     """
 
     def __init__(
         self,
-        output_dir: Optional[Path] = None,
         timeout: int = 120,
         chunk_size: int = 8192,
         max_retries: int = 3,
     ):
-        self.output_dir = output_dir or settings.paths.audio_dir
         self.timeout = timeout
         self.chunk_size = chunk_size
         self.max_retries = max_retries
+        self._gcs_service = None
 
-    def _get_output_path(
-        self,
-        episode: EpisodeInfo,
-        custom_filename: Optional[str] = None,
-    ) -> Path:
-        """Generate output path for downloaded audio."""
-        if custom_filename:
-            filename = custom_filename
-        else:
-            # Use feed_id + episode_id for unique filename
-            filename = f"{episode.feed_id}_{episode.episode_id}.mp3"
+    @property
+    def gcs_service(self):
+        """Lazily create GCS service."""
+        if self._gcs_service is None:
+            from innovation_intelligence.ingestion.gcs_service import GCSStorageService
+            self._gcs_service = GCSStorageService()
+        return self._gcs_service
 
-        return self.output_dir / filename
+    def _get_episode_id(self, episode: EpisodeInfo) -> str:
+        """Generate unique episode ID for GCS storage."""
+        return f"{episode.feed_id}_{episode.episode_id}"
 
     def _download_with_retry(
         self,
@@ -114,103 +118,118 @@ class AudioDownloadService:
         log.info(f"[DOWNLOAD] Downloaded {downloaded / (1024*1024):.1f} MB to {output_path.name}")
         return output_path
 
-    def download(
+    def download_to_gcs(
         self,
         episode: EpisodeInfo,
-        output_dir: Optional[Path] = None,
-        custom_filename: Optional[str] = None,
+        trim_start: int = 0,
+        trim_end: Optional[int] = None,
         progress_callback: Optional[ProgressCallback] = None,
-    ) -> Path:
+    ) -> str:
         """
-        Download audio for an episode.
+        Download audio and upload directly to GCS (GCS-first mode).
+
+        Uses temporary files only when trimming is required.
 
         Args:
             episode: Episode to download
-            output_dir: Override output directory
-            custom_filename: Override filename
+            trim_start: Seconds to trim from start (optional)
+            trim_end: Optional end time (seconds from start)
             progress_callback: Optional progress callback
 
         Returns:
-            Path to downloaded file
+            GCS URI of uploaded audio
         """
-        if output_dir:
-            self.output_dir = output_dir
+        episode_id = self._get_episode_id(episode)
 
-        output_path = self._get_output_path(episode, custom_filename)
+        # Check if already in GCS
+        if self.gcs_service.podcast_audio_exists(episode_id):
+            gcs_uri = self.gcs_service.get_podcast_audio_gcs_uri(episode_id)
+            log.info(f"[DOWNLOAD] Audio already in GCS: {gcs_uri}")
+            return gcs_uri
 
-        # Skip if already downloaded
-        if output_path.exists():
-            log.info(f"[DOWNLOAD] Audio already exists: {output_path.name}")
-            return output_path
-
-        log.info(f"[DOWNLOAD] Downloading: {episode.title[:50]}...")
-        return self._download_with_retry(
-            episode.audio_url,
-            output_path,
-            progress_callback,
-        )
-
-    def download_and_trim(
-        self,
-        episode: EpisodeInfo,
-        output_dir: Optional[Path] = None,
-        trim_start: int = 0,
-        trim_end: Optional[int] = None,
-        custom_filename: Optional[str] = None,
-        progress_callback: Optional[ProgressCallback] = None,
-    ) -> Path:
-        """
-        Download and optionally trim audio.
-
-        Args:
-            episode: Episode to download
-            output_dir: Override output directory
-            trim_start: Seconds to trim from start
-            trim_end: Optional end time (seconds from start)
-            custom_filename: Override filename
-            progress_callback: Progress callback for download
-
-        Returns:
-            Path to processed file
-        """
-        if output_dir:
-            self.output_dir = output_dir
-
-        output_path = self._get_output_path(episode, custom_filename)
-
-        # Skip if already processed
-        if output_path.exists():
-            log.info(f"[DOWNLOAD] Processed audio already exists: {output_path.name}")
-            return output_path
-
-        # Check if ffmpeg is available
+        # If trimming required, use temporary files
         if trim_start > 0 or trim_end:
-            if not self._ffmpeg_available():
-                log.warning("[DOWNLOAD] ffmpeg not available, downloading without trim")
-                trim_start = 0
-                trim_end = None
+            return self._download_trim_and_upload(
+                episode, episode_id, trim_start, trim_end, progress_callback
+            )
 
-        if trim_start == 0 and trim_end is None:
-            # No trimming needed, just download
-            return self.download(episode, output_dir, custom_filename, progress_callback)
-
-        # Download to temp file first
+        # Otherwise, download to temp and upload to GCS
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             tmp_path = Path(tmp.name)
 
         try:
-            log.info(f"[DOWNLOAD] Downloading to temp: {episode.title[:50]}...")
-            self._download_with_retry(episode.audio_url, tmp_path, progress_callback)
+            log.info(f"[DOWNLOAD] Downloading: {episode.title[:50]}...")
+            self._download_with_retry(
+                episode.audio_url,
+                tmp_path,
+                progress_callback,
+            )
 
-            log.info(f"[DOWNLOAD] Trimming audio (start={trim_start}s)...")
-            self._trim_audio(tmp_path, output_path, trim_start, trim_end)
+            # Upload to GCS
+            gcs_uri = self.gcs_service.upload_podcast_audio(tmp_path, episode_id)
+            log.info(f"[DOWNLOAD] Uploaded to GCS: {gcs_uri}")
 
-            return output_path
+            return gcs_uri
 
         finally:
             # Clean up temp file
             if tmp_path.exists():
                 tmp_path.unlink()
+                log.debug(f"[DOWNLOAD] Cleaned up temp file: {tmp_path}")
+
+    def _download_trim_and_upload(
+        self,
+        episode: EpisodeInfo,
+        episode_id: str,
+        trim_start: int,
+        trim_end: Optional[int],
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> str:
+        """Download audio, trim with ffmpeg, and upload to GCS."""
+        # Check if ffmpeg is available
+        if not self._ffmpeg_available():
+            log.warning("[DOWNLOAD] ffmpeg not available, uploading without trim")
+            return self.download_to_gcs(episode, 0, None, progress_callback)
+
+        # Download to temp file
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_download:
+            tmp_download_path = Path(tmp_download.name)
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_trimmed:
+            tmp_trimmed_path = Path(tmp_trimmed.name)
+
+        try:
+            log.info(f"[DOWNLOAD] Downloading to temp: {episode.title[:50]}...")
+            self._download_with_retry(episode.audio_url, tmp_download_path, progress_callback)
+
+            log.info(f"[DOWNLOAD] Trimming audio (start={trim_start}s)...")
+            self._trim_audio(tmp_download_path, tmp_trimmed_path, trim_start, trim_end)
+
+            # Upload trimmed audio to GCS
+            gcs_uri = self.gcs_service.upload_podcast_audio(tmp_trimmed_path, episode_id)
+            log.info(f"[DOWNLOAD] Uploaded trimmed audio to GCS: {gcs_uri}")
+
+            return gcs_uri
+
+        finally:
+            # Clean up temp files
+            for path in [tmp_download_path, tmp_trimmed_path]:
+                if path.exists():
+                    path.unlink()
+                    log.debug(f"[DOWNLOAD] Cleaned up temp file: {path}")
+
+    def get_gcs_uri(self, episode: EpisodeInfo) -> str:
+        """
+        Get the GCS URI for an episode's audio.
+
+        Args:
+            episode: Episode info
+
+        Returns:
+            GCS URI
+        """
+        episode_id = self._get_episode_id(episode)
+        return self.gcs_service.get_podcast_audio_gcs_uri(episode_id)
 
     def _ffmpeg_available(self) -> bool:
         """Check if ffmpeg is available."""
@@ -256,20 +275,3 @@ class AudioDownloadService:
 
         log.info(f"[DOWNLOAD] Trimmed audio saved: {output_path.name}")
         return output_path
-
-    def cleanup(self, episode: EpisodeInfo) -> bool:
-        """
-        Delete downloaded audio for an episode.
-
-        Args:
-            episode: Episode whose audio to delete
-
-        Returns:
-            True if file was deleted
-        """
-        output_path = self._get_output_path(episode)
-        if output_path.exists():
-            output_path.unlink()
-            log.info(f"[DOWNLOAD] Deleted: {output_path.name}")
-            return True
-        return False

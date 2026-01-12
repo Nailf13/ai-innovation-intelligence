@@ -3,15 +3,16 @@
 Transcription service for podcast audio.
 
 Provides:
-- WhisperX transcription via Modal GPU
-- Local file handling
+- Google Speech API (Chirp) transcription
+- GCS integration for cloud-based transcription
+- Local and cloud transcript storage
 - Transcript persistence
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from innovation_intelligence.config import settings
 from innovation_intelligence.logger import get_logger
@@ -22,96 +23,94 @@ log = get_logger(__name__)
 
 class TranscriptionService:
     """
-    Service for transcribing podcast audio.
+    Service for transcribing podcast audio using Google Speech API (Chirp).
 
-    Uses Modal for GPU-accelerated transcription with WhisperX.
-    Falls back to local processing if Modal is not available.
+    Uses GCS-first storage - transcripts are stored in GCS and never saved locally.
+    Audio must be in GCS before transcription (use AudioDownloadService.download_to_gcs).
 
     Usage:
         service = TranscriptionService()
-        transcript_path = service.transcribe(audio_path, episode_info)
+
+        # Transcribe from GCS URI (GCS-first mode)
+        gcs_transcript_uri = service.transcribe_from_gcs(gcs_audio_uri, episode)
+
+        # Load transcript data from GCS
+        data = service.get_transcript(gcs_transcript_uri)
     """
 
     def __init__(
         self,
-        output_dir: Optional[Path] = None,
-        use_modal: bool = True,
+        language_codes: Optional[List[str]] = None,
     ):
-        self.output_dir = output_dir or settings.paths.transcripts_dir
-        self.use_modal = use_modal
-        self._modal_model = None
-
-    def _get_output_path(
-        self,
-        episode: EpisodeInfo,
-        db_episode_id: Optional[int] = None,
-    ) -> Path:
-        """Generate output path for transcript."""
-        if db_episode_id:
-            filename = f"episode_{db_episode_id}.json"
-        else:
-            filename = f"{episode.feed_id}_{episode.episode_id}.json"
-
-        return self.output_dir / filename
-
-    def _load_modal_model(self):
-        """Lazily load the Modal model."""
-        if self._modal_model is None:
-            try:
-                from innovation_intelligence.ingestion.podcasts.modal_app import Model
-                self._modal_model = Model()
-                log.info("[TRANSCRIBE] Modal model initialized")
-            except ImportError as e:
-                log.warning(f"[TRANSCRIBE] Modal not available: {e}")
-                self.use_modal = False
-            except Exception as e:
-                log.error(f"[TRANSCRIBE] Failed to initialize Modal: {e}")
-                self.use_modal = False
-
-        return self._modal_model
-
-    def transcribe(
-        self,
-        audio_path: Path,
-        episode: EpisodeInfo,
-        db_episode_id: Optional[int] = None,
-        force: bool = False,
-    ) -> Path:
         """
-        Transcribe an audio file.
+        Initialize the transcription service.
 
         Args:
-            audio_path: Path to audio file
+            language_codes: Language codes for transcription (default: ["en-US"])
+        """
+        self.language_codes = language_codes or ["en-US"]
+        self._chirp_service = None
+        self._gcs_service = None
+
+    @property
+    def chirp_service(self):
+        """Lazily load the Chirp transcription service."""
+        if self._chirp_service is None:
+            from innovation_intelligence.ingestion.podcasts.chirp_transcription import (
+                ChirpTranscriptionService,
+            )
+            self._chirp_service = ChirpTranscriptionService(
+                language_codes=self.language_codes,
+            )
+            log.info("[TRANSCRIBE] Chirp service initialized")
+        return self._chirp_service
+
+    @property
+    def gcs_service(self):
+        """Lazily create GCS service."""
+        if self._gcs_service is None:
+            from innovation_intelligence.ingestion.gcs_service import GCSStorageService
+            self._gcs_service = GCSStorageService()
+        return self._gcs_service
+
+    def _get_episode_id(self, episode: EpisodeInfo) -> str:
+        """Generate episode ID for storage."""
+        return f"{episode.feed_id}_{episode.episode_id}"
+
+    def transcribe_from_gcs(
+        self,
+        gcs_audio_uri: str,
+        episode: EpisodeInfo,
+        force: bool = False,
+    ) -> str:
+        """
+        Transcribe audio from GCS and store transcript in GCS (GCS-first mode).
+
+        Args:
+            gcs_audio_uri: GCS URI of the audio file (gs://bucket/path)
             episode: Episode info (for metadata)
-            db_episode_id: Database episode ID (for filename)
             force: Force re-transcription even if transcript exists
 
         Returns:
-            Path to transcript JSON file
+            GCS URI of the transcript
         """
-        output_path = self._get_output_path(episode, db_episode_id)
+        episode_id = self._get_episode_id(episode)
 
-        # Check for existing transcript
-        if output_path.exists() and not force:
-            log.info(f"[TRANSCRIBE] Transcript exists: {output_path.name}")
-            return output_path
-
-        log.info(f"[TRANSCRIBE] Transcribing: {episode.title[:50]}...")
-
-        # Load audio bytes
-        if not audio_path.exists():
-            raise FileNotFoundError(f"Audio file not found: {audio_path}")
-
-        audio_bytes = audio_path.read_bytes()
-
-        # Transcribe using Modal
-        if self.use_modal:
-            transcript_data = self._transcribe_modal(audio_bytes)
-        else:
-            raise NotImplementedError(
-                "Local transcription not implemented. "
-                "Please ensure Modal is configured."
+        # Check for existing transcript in GCS
+        if not force and self.gcs_service.transcript_exists(episode_id, content_type="podcast"):
+            gcs_transcript_uri = self.gcs_service.get_transcript_gcs_uri(
+                episode_id, content_type="podcast"
             )
+            log.info(f"[TRANSCRIBE] Transcript already exists in GCS: {gcs_transcript_uri}")
+            return gcs_transcript_uri
+
+        log.info(f"[TRANSCRIBE] Transcribing from GCS: {episode.title[:50]}...")
+
+        # Transcribe directly from GCS
+        transcript_data = self.chirp_service.transcribe(
+            gcs_uri=gcs_audio_uri,
+            language_codes=self.language_codes,
+        )
 
         # Add metadata
         transcript_data["_metadata"] = {
@@ -119,81 +118,71 @@ class TranscriptionService:
             "episode_id": episode.episode_id,
             "feed_id": episode.feed_id,
             "published_at": episode.published_at.isoformat() if episode.published_at else None,
-            "audio_path": str(audio_path),
+            "gcs_audio_uri": gcs_audio_uri,
+            "transcription_service": "google_speech_chirp",
         }
 
-        # Save transcript
-        self._save_transcript(transcript_data, output_path)
+        # Store transcript in GCS
+        gcs_transcript_uri = self.gcs_service.store_transcript(
+            data=transcript_data,
+            content_id=episode_id,
+            content_type="podcast",
+        )
+        log.info(f"[TRANSCRIBE] Stored transcript in GCS: {gcs_transcript_uri}")
 
-        log.info(f"[TRANSCRIBE] Saved transcript: {output_path.name}")
-        return output_path
+        return gcs_transcript_uri
 
-    def _transcribe_modal(self, audio_bytes: bytes) -> Dict[str, Any]:
-        """Transcribe using Modal GPU."""
-        model = self._load_modal_model()
-        if model is None:
-            raise RuntimeError("Modal model not available")
-
-        # Call Modal remote function
-        transcript_json = model.transcribe_with_diarization.remote(audio_bytes)
-
-        # Parse JSON response
-        return json.loads(transcript_json)
-
-    def _save_transcript(self, data: Dict[str, Any], output_path: Path) -> None:
-        """Save transcript to JSON file."""
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-    def load_transcript(self, transcript_path: Path) -> Dict[str, Any]:
+    def get_transcript(self, gcs_transcript_uri: str) -> Dict[str, Any]:
         """
-        Load a transcript from disk.
+        Load a transcript from GCS.
 
         Args:
-            transcript_path: Path to transcript JSON
+            gcs_transcript_uri: GCS URI of the transcript
 
         Returns:
             Transcript data dictionary
         """
-        with open(transcript_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return self.gcs_service.get_transcript(gcs_transcript_uri)
 
-    def get_segment_count(self, transcript_path: Path) -> int:
-        """Get number of segments in a transcript."""
-        data = self.load_transcript(transcript_path)
-        return len(data.get("segments", []))
-
-    def cleanup(self, episode: EpisodeInfo, db_episode_id: Optional[int] = None) -> bool:
+    def get_transcript_by_episode(self, episode: EpisodeInfo) -> Optional[Dict[str, Any]]:
         """
-        Delete transcript for an episode.
+        Load a transcript from GCS by episode info.
 
         Args:
             episode: Episode info
-            db_episode_id: Database episode ID
 
         Returns:
-            True if file was deleted
+            Transcript data dictionary or None if not found
         """
-        output_path = self._get_output_path(episode, db_episode_id)
-        if output_path.exists():
-            output_path.unlink()
-            log.info(f"[TRANSCRIBE] Deleted: {output_path.name}")
-            return True
-        return False
+        episode_id = self._get_episode_id(episode)
+        if self.gcs_service.transcript_exists(episode_id, content_type="podcast"):
+            gcs_uri = self.gcs_service.get_transcript_gcs_uri(episode_id, content_type="podcast")
+            return self.gcs_service.get_transcript(gcs_uri)
+        return None
 
+    def get_segment_count_from_gcs(self, gcs_transcript_uri: str) -> int:
+        """
+        Get number of segments in a transcript from GCS.
 
-class TranscriptionServiceLocal:
-    """
-    Local transcription service (without Modal).
+        Args:
+            gcs_transcript_uri: GCS URI of the transcript
 
-    This is a placeholder for environments where Modal is not available.
-    Requires local GPU and WhisperX installation.
-    """
+        Returns:
+            Number of segments
+        """
+        data = self.get_transcript(gcs_transcript_uri)
+        return len(data.get("segments", []))
 
-    def __init__(self):
-        raise NotImplementedError(
-            "Local transcription requires WhisperX and GPU. "
-            "Use TranscriptionService with Modal for cloud GPU."
-        )
+    def delete_transcript(self, episode: EpisodeInfo) -> bool:
+        """
+        Delete transcript from GCS.
+
+        Args:
+            episode: Episode info
+
+        Returns:
+            True if deleted
+        """
+        episode_id = self._get_episode_id(episode)
+        gcs_uri = self.gcs_service.get_transcript_gcs_uri(episode_id, content_type="podcast")
+        return self.gcs_service.delete_file(gcs_uri)

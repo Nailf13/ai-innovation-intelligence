@@ -39,14 +39,15 @@ MAX_GAP_SECS = 5.0
 
 @dataclass
 class PodcastChunk:
-    """A chunk from a podcast transcript."""
+    """A chunk from a podcast transcript.
+
+    Note: source format should be "podcast_name - episode_title"
+    """
     chunk_id: str
     text: str
-    speaker: str
-    speakers: List[str]          # All speakers in this chunk
     start: float                 # Start timestamp
     end: float                   # End timestamp
-    source: str                  # Episode identifier
+    source: str                  # Format: "podcast_name - episode_title"
     episode_date: Optional[str] = None
     overlap_text: str = ""       # Text from previous chunk for context
     word_count: int = 0
@@ -57,8 +58,6 @@ class PodcastChunk:
         return {
             "chunk_id": self.chunk_id,
             "text": self.text,
-            "speaker": self.speaker,
-            "speakers": self.speakers,
             "start": self.start,
             "end": self.end,
             "source": self.source,
@@ -352,8 +351,6 @@ class PodcastChunker:
                 chunk = PodcastChunk(
                     chunk_id=f"{source}_chunk_{chunk_idx:04d}",
                     text=part_text,
-                    speaker=turn.speaker,
-                    speakers=[turn.speaker],
                     start=part_start,
                     end=part_end,
                     source=source,
@@ -397,16 +394,14 @@ class PodcastChunker:
 
             last = merged[-1]
 
-            # Merge if current chunk is tiny and same speaker
-            if chunk.char_count < self.min_chars and chunk.speaker == last.speaker:
+            # Merge if current chunk is tiny
+            if chunk.char_count < self.min_chars:
                 # Merge with previous
                 combined_text = f"{last.text} {chunk.text}"
                 if len(combined_text) <= self.max_chars:
                     merged[-1] = PodcastChunk(
                         chunk_id=last.chunk_id,
                         text=combined_text,
-                        speaker=last.speaker,
-                        speakers=list(set(last.speakers + chunk.speakers)),
                         start=last.start,
                         end=chunk.end,
                         source=last.source,
@@ -430,10 +425,13 @@ def chunk_podcast_transcript(
     **chunker_kwargs,
 ) -> List[PodcastChunk]:
     """
-    Convenience function to chunk a podcast transcript file.
+    Convenience function to chunk a podcast transcript file (local file only).
+
+    NOTE: This function is for CLI/testing with local files only.
+    For production use with GCS, use chunk_from_gcs() or PodcastChunker.chunk() directly.
 
     Args:
-        transcript_path: Path to transcript JSON
+        transcript_path: Path to LOCAL transcript JSON file
         source: Source identifier (defaults to filename)
         episode_date: Episode date
         **chunker_kwargs: Arguments for PodcastChunker
@@ -470,6 +468,59 @@ def chunk_podcast_transcript(
     )
 
 
+def chunk_from_gcs(
+    gcs_transcript_uri: str,
+    source: str,
+    episode_date: Optional[str] = None,
+    **chunker_kwargs,
+) -> List[PodcastChunk]:
+    """
+    Chunk a podcast transcript from GCS (GCS-first production use).
+
+    Args:
+        gcs_transcript_uri: GCS URI (gs://bucket/podcasts/transcripts/episode.json)
+        source: Episode identifier (format: "podcast_name - episode_title")
+        episode_date: Episode publication date
+        **chunker_kwargs: Arguments for PodcastChunker
+
+    Returns:
+        List of PodcastChunk objects
+
+    Example:
+        chunks = chunk_from_gcs(
+            gcs_transcript_uri="gs://bucket/podcasts/transcripts/episode_123.json",
+            source="Huberman Lab - Episode 123",
+            episode_date="2024-01-15"
+        )
+    """
+    from innovation_intelligence.ingestion.gcs_service import GCSStorageService
+
+    gcs_service = GCSStorageService()
+    data = gcs_service.read_json(gcs_transcript_uri)
+
+    segments = data.get("segments", [])
+    if not segments:
+        log.warning(f"No segments in {gcs_transcript_uri}")
+        return []
+
+    # Extract episode metadata
+    metadata = {
+        "episode_title": data.get("episode_title", source),
+        "speaker_map": data.get("speaker_map", {}),
+    }
+
+    if episode_date is None:
+        episode_date = data.get("episode_date")
+
+    chunker = PodcastChunker(**chunker_kwargs)
+    return chunker.chunk(
+        segments,
+        source=source,
+        episode_date=episode_date,
+        metadata=metadata,
+    )
+
+
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
@@ -489,7 +540,7 @@ if __name__ == "__main__":
     print(f"{'='*60}\n")
 
     for i, chunk in enumerate(chunks[:5]):
-        print(f"[{i}] {chunk.speaker} ({chunk.start:.1f}s - {chunk.end:.1f}s)")
+        print(f"[{i}] ({chunk.start:.1f}s - {chunk.end:.1f}s)")
         print(f"    {chunk.text[:100]}...")
         print(f"    ({chunk.char_count} chars, {chunk.word_count} words)")
         print()

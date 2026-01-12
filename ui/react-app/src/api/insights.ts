@@ -1,5 +1,5 @@
 import apiClient from './client';
-import { UnitInsight, MacroInsight, Cluster, InsightHierarchy, SearchResult } from '../types';
+import { UnitInsight, MacroInsight, Cluster, InsightHierarchy, SearchResult, VisualizationData } from '../types';
 
 export const insightsApi = {
   // List unit insights
@@ -75,6 +75,12 @@ export const insightsApi = {
       top_k: topK,
       source_type: sourceType,
     });
+    return response.data;
+  },
+
+  // Get visualization data
+  getVisualizationData: async (): Promise<VisualizationData> => {
+    const response = await apiClient.get('/insights/visualization-data');
     return response.data;
   },
 };

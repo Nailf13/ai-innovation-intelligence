@@ -23,8 +23,6 @@ class IngestionStatus(str, Enum):
     DOWNLOADED = "downloaded"
     TRANSCRIBING = "transcribing"
     TRANSCRIBED = "transcribed"
-    IDENTIFYING_SPEAKERS = "identifying_speakers"
-    SPEAKERS_IDENTIFIED = "speakers_identified"
     INDEXING = "indexing"
     INDEXED = "indexed"
     COMPLETED = "completed"
@@ -37,7 +35,6 @@ class IngestionStage(str, Enum):
     SEARCH = "search"
     DOWNLOAD = "download"
     TRANSCRIBE = "transcribe"
-    SPEAKER_ID = "speaker_identification"
     INDEX = "index"
 
 
@@ -153,7 +150,6 @@ class IngestionRequest:
     podcast_info: Optional[PodcastInfo] = None
 
     # Pipeline configuration
-    skip_speaker_identification: bool = False
     skip_indexing: bool = False
     trim_audio_seconds: int = 0  # Seconds to trim from start
 
@@ -166,7 +162,6 @@ class IngestionRequest:
         return {
             "episodes": [e.to_dict() for e in self.episodes],
             "podcast_info": self.podcast_info.to_dict() if self.podcast_info else None,
-            "skip_speaker_identification": self.skip_speaker_identification,
             "skip_indexing": self.skip_indexing,
             "trim_audio_seconds": self.trim_audio_seconds,
             "max_episodes": self.max_episodes,
@@ -177,17 +172,16 @@ class IngestionRequest:
 
 @dataclass
 class EpisodeIngestionResult:
-    """Result of ingesting a single episode."""
+    """Result of ingesting a single episode (GCS-first mode)."""
     episode_info: EpisodeInfo
     status: IngestionStatus
     db_episode_id: Optional[int] = None
 
-    # Paths
-    audio_path: Optional[Path] = None
-    transcript_path: Optional[Path] = None
+    # GCS URIs (primary storage)
+    gcs_audio_uri: Optional[str] = None
+    gcs_transcript_uri: Optional[str] = None
 
     # Processing metadata
-    speaker_map: Dict[str, str] = field(default_factory=dict)
     chunks_indexed: int = 0
 
     # Timing
@@ -213,9 +207,8 @@ class EpisodeIngestionResult:
             "episode_info": self.episode_info.to_dict(),
             "status": self.status.value,
             "db_episode_id": self.db_episode_id,
-            "audio_path": str(self.audio_path) if self.audio_path else None,
-            "transcript_path": str(self.transcript_path) if self.transcript_path else None,
-            "speaker_map": self.speaker_map,
+            "gcs_audio_uri": self.gcs_audio_uri,
+            "gcs_transcript_uri": self.gcs_transcript_uri,
             "chunks_indexed": self.chunks_indexed,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,

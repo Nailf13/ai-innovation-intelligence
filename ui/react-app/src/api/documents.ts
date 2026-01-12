@@ -1,5 +1,5 @@
 import apiClient from './client';
-import { Document } from '../types';
+import { Document, IngestionTask } from '../types';
 
 export const documentsApi = {
   // List all documents
@@ -38,5 +38,29 @@ export const documentsApi = {
   // Delete a document
   delete: async (id: number): Promise<void> => {
     await apiClient.delete(`/documents/${id}`);
+  },
+
+  // Process document (index for vector search)
+  processDocument: async (documentId: number): Promise<IngestionTask> => {
+    const response = await apiClient.post(`/documents/process/${documentId}`);
+    return response.data;
+  },
+
+  // Get processing status
+  getProcessingStatus: async (taskId: string): Promise<IngestionTask> => {
+    const response = await apiClient.get(`/documents/process/status/${taskId}`);
+    return response.data;
+  },
+
+  // Check if document has been analyzed
+  checkAnalyzed: async (documentId: number): Promise<{ analyzed: boolean; insight_count: number }> => {
+    const response = await apiClient.get(`/documents/${documentId}/analyzed`);
+    return response.data;
+  },
+
+  // Get document processing status
+  getDocumentProcessingStatus: async (documentId: number): Promise<{ status: string }> => {
+    const response = await apiClient.get(`/documents/${documentId}/processing-status`);
+    return response.data;
   },
 };

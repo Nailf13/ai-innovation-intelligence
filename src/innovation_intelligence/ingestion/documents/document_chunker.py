@@ -265,6 +265,72 @@ class DocumentChunker:
 
         return chunks
 
+    def chunk_from_segments(
+        self,
+        segments: List[Dict[str, Any]],
+        source: str,
+        document_date: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[DocumentChunk]:
+        """
+        Chunk document from segments with page information (preferred method).
+
+        Args:
+            segments: List of segments with 'text' and 'page' fields
+            source: Document identifier
+            document_date: Document date
+            metadata: Additional metadata
+
+        Returns:
+            List of DocumentChunk objects with accurate page numbers
+        """
+        metadata = metadata or {}
+
+        # Convert segments to blocks with accurate page numbers
+        blocks: List[TextBlock] = []
+        current_section = None
+
+        for segment in segments:
+            page_text = segment.get("text", "")
+            page_num = segment.get("page", 1)
+
+            if not page_text.strip():
+                continue
+
+            # Split page into paragraphs
+            paragraphs = re.split(r'\n\s*\n', page_text)
+
+            for para in paragraphs:
+                para = para.strip()
+                if not para:
+                    continue
+
+                # Check if it's a heading
+                if self._is_heading(para):
+                    current_section = para
+                    blocks.append(TextBlock(
+                        text=para,
+                        block_type="heading",
+                        page=page_num,
+                        section=current_section,
+                    ))
+                else:
+                    blocks.append(TextBlock(
+                        text=para,
+                        block_type="paragraph",
+                        page=page_num,
+                        section=current_section,
+                    ))
+
+        if not blocks:
+            log.warning(f"[CHUNKER] No blocks extracted from segments")
+            return []
+
+        log.debug(f"[CHUNKER] Split into {len(blocks)} blocks from {len(segments)} pages")
+
+        # Use the standard chunking logic with accurate page numbers
+        return self._group_blocks_into_chunks(blocks, source, document_date, metadata)
+
     def chunk(
         self,
         text: str,
@@ -273,7 +339,9 @@ class DocumentChunker:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> List[DocumentChunk]:
         """
-        Chunk document text.
+        Chunk document text (legacy method, uses heuristic page detection).
+
+        For better page accuracy, use chunk_from_segments() instead.
 
         Args:
             text: Full document text
@@ -291,6 +359,28 @@ class DocumentChunker:
         if not blocks:
             log.warning(f"[CHUNKER] No blocks extracted from document")
             return []
+
+        return self._group_blocks_into_chunks(blocks, source, document_date, metadata)
+
+    def _group_blocks_into_chunks(
+        self,
+        blocks: List[TextBlock],
+        source: str,
+        document_date: Optional[str],
+        metadata: Dict[str, Any],
+    ) -> List[DocumentChunk]:
+        """
+        Group text blocks into chunks (extracted for reuse).
+
+        Args:
+            blocks: List of text blocks with page info
+            source: Document identifier
+            document_date: Document date
+            metadata: Additional metadata
+
+        Returns:
+            List of DocumentChunk objects
+        """
 
         # Step 2: Group blocks into chunks
         chunks: List[DocumentChunk] = []

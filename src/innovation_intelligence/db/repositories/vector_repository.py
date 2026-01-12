@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import select, delete, func, text
 from sqlalchemy.orm import Session
@@ -21,9 +21,12 @@ from innovation_intelligence.db.models import (
     DocumentChunkVector,
     EMBEDDING_DIM,
 )
-from innovation_intelligence.chunking.podcast_chunker import PodcastChunk
-from innovation_intelligence.chunking.document_chunker import DocumentChunk
 from innovation_intelligence.logger import get_logger
+
+# Lazy import to avoid circular dependency
+if TYPE_CHECKING:
+    from innovation_intelligence.ingestion.podcasts.podcast_chunker import PodcastChunk
+    from innovation_intelligence.ingestion.documents.document_chunker import DocumentChunk
 
 log = get_logger(__name__)
 
@@ -51,7 +54,7 @@ class VectorRepository:
     # -----------------------------------------------------------------
     def store_podcast_chunk(
         self,
-        chunk: PodcastChunk,
+        chunk: "PodcastChunk",
         embedding: List[float],
     ) -> PodcastChunkVector:
         """
@@ -85,8 +88,6 @@ class VectorRepository:
             chunk_id=chunk.chunk_id,
             chunk_text=chunk.full_text,  # Include overlap for context
             embedding=embedding,
-            speaker=chunk.speaker,
-            speakers=chunk.speakers,
             start_time=chunk.start,
             end_time=chunk.end,
             source=chunk.source,
@@ -98,7 +99,7 @@ class VectorRepository:
 
     def store_podcast_chunks_batch(
         self,
-        chunks: List[PodcastChunk],
+        chunks: List["PodcastChunk"],
         embeddings: List[List[float]],
     ) -> int:
         """
@@ -133,7 +134,6 @@ class VectorRepository:
         query_embedding: List[float],
         top_k: int = 10,
         source_filter: Optional[str] = None,
-        speaker_filter: Optional[str] = None,
     ) -> List[SearchResult]:
         """
         Search for similar podcast chunks.
@@ -141,8 +141,7 @@ class VectorRepository:
         Args:
             query_embedding: The query vector
             top_k: Number of results to return
-            source_filter: Optional filter by source/episode
-            speaker_filter: Optional filter by speaker
+            source_filter: Optional filter by source (podcast_name - episode_title)
 
         Returns:
             List of SearchResult ordered by similarity
@@ -163,9 +162,6 @@ class VectorRepository:
         if source_filter:
             query = query.where(PodcastChunkVector.source == source_filter)
 
-        if speaker_filter:
-            query = query.where(PodcastChunkVector.speaker == speaker_filter)
-
         results = self.session.execute(query).all()
 
         return [
@@ -175,8 +171,6 @@ class VectorRepository:
                 score=float(row.similarity),
                 source=row.PodcastChunkVector.source,
                 metadata={
-                    "speaker": row.PodcastChunkVector.speaker,
-                    "speakers": row.PodcastChunkVector.speakers,
                     "start": row.PodcastChunkVector.start_time,
                     "end": row.PodcastChunkVector.end_time,
                     "episode_date": (
@@ -218,7 +212,7 @@ class VectorRepository:
     # -----------------------------------------------------------------
     def store_document_chunk(
         self,
-        chunk: DocumentChunk,
+        chunk: "DocumentChunk",
         embedding: List[float],
     ) -> DocumentChunkVector:
         """
@@ -263,7 +257,7 @@ class VectorRepository:
 
     def store_document_chunks_batch(
         self,
-        chunks: List[DocumentChunk],
+        chunks: List["DocumentChunk"],
         embeddings: List[List[float]],
     ) -> int:
         """
@@ -368,6 +362,14 @@ class VectorRepository:
             select(func.count(DocumentChunkVector.id))
         )
         return result.scalar() or 0
+
+    def count_podcast_chunks(self) -> int:
+        """Get total number of podcast chunks (alias for get_podcast_chunk_count)."""
+        return self.get_podcast_chunk_count()
+
+    def count_document_chunks(self) -> int:
+        """Get total number of document chunks (alias for get_document_chunk_count)."""
+        return self.get_document_chunk_count()
 
     # -----------------------------------------------------------------
     # Combined search

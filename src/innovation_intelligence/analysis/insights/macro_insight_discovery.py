@@ -5,6 +5,13 @@ This module handles:
 - Clustering UnitInsights by embedding similarity
 - LLM-based naming for macro insights
 - Persisting MacroInsight entities to database
+- Incremental matching: new UnitInsights first match existing MacroInsight centroids
+
+Key behaviors:
+- A MacroInsight is created only when at least 2 UnitInsights are semantically similar
+- Isolated UnitInsights remain unassigned as candidates for future clustering
+- Incremental updates: new UnitInsights match existing centroids before forming new groups
+- Centroid is updated when injecting new UnitInsights into existing MacroInsights
 """
 from __future__ import annotations
 
@@ -23,6 +30,8 @@ from innovation_intelligence.logger import get_logger
 log = get_logger(__name__)
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.75
+MIN_CLUSTER_SIZE = 2  # Minimum UnitInsights required to form a MacroInsight
+
 
 # Data Structures (for internal use)
 @dataclass
@@ -35,10 +44,140 @@ class MacroInsightCandidate:
     centroid: List[float]
 
 
+@dataclass
+class MacroInsightUpdate:
+    """Represents an update to an existing MacroInsight."""
+
+    macro_insight_id: int
+    new_unit_insight_ids: List[int]
+    updated_centroid: List[float]
+
+
 # Similarity Helpers
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     """Compute cosine similarity between two vectors (assumes normalized)."""
     return float(np.dot(a, b))
+
+
+def normalize_vector(vec: np.ndarray) -> np.ndarray:
+    """Normalize a vector to unit length."""
+    norm = np.linalg.norm(vec)
+    if norm > 0:
+        return vec / norm
+    return vec
+
+
+def compute_centroid(vectors: List[np.ndarray]) -> np.ndarray:
+    """Compute normalized centroid from a list of vectors."""
+    centroid = np.mean(vectors, axis=0)
+    return normalize_vector(centroid)
+
+
+def match_against_existing_macros(
+    session: Session,
+    unit_insights: List[UnitInsight],
+    similarity_threshold: float,
+) -> tuple[List[MacroInsightUpdate], List[UnitInsight]]:
+    """
+    Match new UnitInsights against existing MacroInsight centroids.
+
+    For each UnitInsight, find the best matching existing MacroInsight.
+    If similarity exceeds threshold, schedule injection into that MacroInsight.
+
+    Args:
+        session: Database session
+        unit_insights: List of unassigned UnitInsight DB models
+        similarity_threshold: Minimum cosine similarity for matching
+
+    Returns:
+        Tuple of:
+        - List of MacroInsightUpdate objects (grouped by macro_insight_id)
+        - List of UnitInsights that did not match any existing MacroInsight
+    """
+    # Fetch all existing MacroInsights with their centroids
+    existing_macros = session.query(MacroInsight).all()
+
+    if not existing_macros:
+        return [], unit_insights
+
+    # Build macro centroid map
+    macro_centroids: dict[int, np.ndarray] = {}
+    for macro in existing_macros:
+        if macro.centroid_embedding:
+            vec = np.array(macro.centroid_embedding, dtype=np.float32)
+            macro_centroids[macro.id] = normalize_vector(vec)
+
+    if not macro_centroids:
+        return [], unit_insights
+
+    # Track which UnitInsights get assigned to which MacroInsight
+    assignments: dict[int, List[int]] = {}  # macro_id -> [unit_insight_ids]
+    unmatched: List[UnitInsight] = []
+
+    for ui in unit_insights:
+        if ui.embedding is None:
+            log.warning("[MACRO] UnitInsight %d has no embedding, skipping", ui.id)
+            unmatched.append(ui)
+            continue
+
+        vec = np.array(ui.embedding, dtype=np.float32)
+        vec = normalize_vector(vec)
+
+        # Find best matching MacroInsight
+        best_macro_id: Optional[int] = None
+        best_similarity = 0.0
+
+        for macro_id, centroid in macro_centroids.items():
+            sim = cosine_similarity(vec, centroid)
+            if sim >= similarity_threshold and sim > best_similarity:
+                best_similarity = sim
+                best_macro_id = macro_id
+
+        if best_macro_id is not None:
+            if best_macro_id not in assignments:
+                assignments[best_macro_id] = []
+            assignments[best_macro_id].append(ui.id)
+            log.info(
+                "[MACRO] UnitInsight %d matched MacroInsight %d (sim=%.3f)",
+                ui.id, best_macro_id, best_similarity
+            )
+        else:
+            unmatched.append(ui)
+
+    # Build MacroInsightUpdate objects with updated centroids
+    updates: List[MacroInsightUpdate] = []
+
+    for macro_id, new_ui_ids in assignments.items():
+        # Get existing UnitInsights in this MacroInsight
+        existing_uis = session.query(UnitInsight).filter(
+            UnitInsight.macro_insight_id == macro_id
+        ).all()
+
+        # Collect all embeddings (existing + new)
+        all_vectors: List[np.ndarray] = []
+
+        for ui in existing_uis:
+            if ui.embedding:
+                vec = np.array(ui.embedding, dtype=np.float32)
+                all_vectors.append(normalize_vector(vec))
+
+        # Add new UnitInsight embeddings
+        new_uis = session.query(UnitInsight).filter(UnitInsight.id.in_(new_ui_ids)).all()
+        for ui in new_uis:
+            if ui.embedding:
+                vec = np.array(ui.embedding, dtype=np.float32)
+                all_vectors.append(normalize_vector(vec))
+
+        # Compute updated centroid
+        if all_vectors:
+            updated_centroid = compute_centroid(all_vectors)
+            updates.append(MacroInsightUpdate(
+                macro_insight_id=macro_id,
+                new_unit_insight_ids=new_ui_ids,
+                updated_centroid=updated_centroid.tolist(),
+            ))
+
+    return updates, unmatched
 
 
 # LLM Naming
@@ -168,19 +307,26 @@ Return ONLY the description text, no JSON or formatting."""
 def cluster_unit_insights(
     unit_insights: List[UnitInsight],
     similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
-) -> List[tuple[List[int], np.ndarray]]:
+    min_cluster_size: int = MIN_CLUSTER_SIZE,
+) -> tuple[List[tuple[List[int], np.ndarray]], List[int]]:
     """
     Cluster unit insights by embedding similarity using greedy algorithm.
+
+    Only creates clusters with at least `min_cluster_size` members.
+    Isolated UnitInsights are returned separately as unassigned.
 
     Args:
         unit_insights: List of UnitInsight DB models (must have embeddings)
         similarity_threshold: Minimum cosine similarity for clustering
+        min_cluster_size: Minimum number of UnitInsights to form a cluster (default 2)
 
     Returns:
-        List of (unit_insight_ids, centroid_vector) tuples
+        Tuple of:
+        - List of (unit_insight_ids, centroid_vector) tuples for valid clusters
+        - List of isolated UnitInsight IDs that remain unassigned
     """
     if not unit_insights:
-        return []
+        return [], []
 
     # Build ID -> normalized vector map
     vectors: dict[int, np.ndarray] = {}
@@ -189,10 +335,7 @@ def cluster_unit_insights(
             log.warning("[MACRO] UnitInsight %d has no embedding, skipping", ui.id)
             continue
         vec = np.array(ui.embedding, dtype=np.float32)
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec = vec / norm
-        vectors[ui.id] = vec
+        vectors[ui.id] = normalize_vector(vec)
 
     used: set[int] = set()
     clusters: List[tuple[List[int], np.ndarray]] = []
@@ -215,16 +358,30 @@ def cluster_unit_insights(
                 cluster_ids.append(other.id)
                 cluster_vecs.append(vectors[other.id])
 
-        # Compute centroid
-        centroid = np.mean(cluster_vecs, axis=0)
-        norm = np.linalg.norm(centroid)
-        if norm > 0:
-            centroid = centroid / norm
+        # Only create cluster if it meets minimum size requirement
+        if len(cluster_ids) >= min_cluster_size:
+            centroid = compute_centroid(cluster_vecs)
+            clusters.append((cluster_ids, centroid))
+            used.update(cluster_ids)
 
-        clusters.append((cluster_ids, centroid))
-        used.update(cluster_ids)
+    # Collect isolated (unassigned) UnitInsight IDs
+    isolated_ids = [ui.id for ui in unit_insights if ui.id in vectors and ui.id not in used]
 
-    return clusters
+    return clusters, isolated_ids
+
+
+@dataclass
+class IncrementalDiscoveryResult:
+    """Result of incremental macro insight discovery."""
+
+    # New MacroInsights to create (clusters of >= MIN_CLUSTER_SIZE)
+    new_candidates: List[MacroInsightCandidate]
+
+    # Updates to existing MacroInsights (new UnitInsights injected)
+    updates: List[MacroInsightUpdate]
+
+    # UnitInsight IDs that remain unassigned (isolated, no matches)
+    isolated_ids: List[int]
 
 
 # Public API
@@ -243,6 +400,10 @@ def discover_macro_insights(
     This is a pure discovery function that returns candidates without persisting.
     Use `discover_and_persist_macro_insights` for full persistence.
 
+    Note: This function only returns NEW MacroInsight candidates. For incremental
+    updates that also inject into existing MacroInsights, use
+    `discover_macro_insights_incremental`.
+
     Args:
         session: Database session
         unit_insight_ids: Optional list of UnitInsight IDs to process (default: all unassigned)
@@ -252,7 +413,49 @@ def discover_macro_insights(
         bedrock: Optional pre-configured BedrockClient
 
     Returns:
-        List of MacroInsightCandidate objects
+        List of MacroInsightCandidate objects (only clusters with >= 2 UnitInsights)
+    """
+    result = discover_macro_insights_incremental(
+        session,
+        unit_insight_ids=unit_insight_ids,
+        similarity_threshold=similarity_threshold,
+        use_llm_naming=use_llm_naming,
+        generate_descriptions=generate_descriptions,
+        bedrock=bedrock,
+    )
+    return result.new_candidates
+
+
+def discover_macro_insights_incremental(
+    session: Session,
+    *,
+    unit_insight_ids: Optional[List[int]] = None,
+    similarity_threshold: float = 0.72,
+    use_llm_naming: bool = True,
+    generate_descriptions: bool = False,
+    bedrock: Optional[BedrockClient] = None,
+) -> IncrementalDiscoveryResult:
+    """
+    Incremental macro insight discovery that supports continuous ingestion.
+
+    Algorithm:
+    1. Fetch unassigned UnitInsights
+    2. Match each against existing MacroInsight centroids
+    3. If similarity >= threshold, inject into existing MacroInsight (update centroid)
+    4. For remaining unmatched UnitInsights, cluster among themselves
+    5. Only create new MacroInsights for clusters with >= 2 members
+    6. Isolated UnitInsights remain unassigned for future clustering
+
+    Args:
+        session: Database session
+        unit_insight_ids: Optional list of UnitInsight IDs to process (default: all unassigned)
+        similarity_threshold: Minimum cosine similarity for clustering (default 0.72)
+        use_llm_naming: Use LLM to generate labels (default True)
+        generate_descriptions: Also generate descriptions via LLM (default False)
+        bedrock: Optional pre-configured BedrockClient
+
+    Returns:
+        IncrementalDiscoveryResult with new candidates, updates, and isolated IDs
     """
     # Fetch unassigned unit insights
     query = session.query(UnitInsight).filter(UnitInsight.macro_insight_id.is_(None))
@@ -262,16 +465,59 @@ def discover_macro_insights(
 
     if not unit_insights:
         log.info("[MACRO] No unassigned UnitInsights found")
-        return []
+        return IncrementalDiscoveryResult(
+            new_candidates=[],
+            updates=[],
+            isolated_ids=[],
+        )
 
     log.info("[MACRO] Processing %d unassigned UnitInsights", len(unit_insights))
 
-    # Build ID -> UnitInsight map
-    ui_map = {ui.id: ui for ui in unit_insights}
+    # Step 1: Match against existing MacroInsight centroids
+    updates, unmatched = match_against_existing_macros(
+        session, unit_insights, similarity_threshold
+    )
 
-    # Cluster
-    clusters = cluster_unit_insights(unit_insights, similarity_threshold)
-    log.info("[MACRO] Found %d clusters", len(clusters))
+    if updates:
+        log.info(
+            "[MACRO] %d UnitInsights matched existing MacroInsights (%d updates)",
+            sum(len(u.new_unit_insight_ids) for u in updates),
+            len(updates),
+        )
+
+    if not unmatched:
+        log.info("[MACRO] All UnitInsights matched existing MacroInsights")
+        return IncrementalDiscoveryResult(
+            new_candidates=[],
+            updates=updates,
+            isolated_ids=[],
+        )
+
+    log.info("[MACRO] %d UnitInsights did not match existing MacroInsights", len(unmatched))
+
+    # Step 2: Cluster unmatched UnitInsights among themselves
+    clusters, isolated_ids = cluster_unit_insights(
+        unmatched, similarity_threshold, min_cluster_size=MIN_CLUSTER_SIZE
+    )
+
+    if isolated_ids:
+        log.info(
+            "[MACRO] %d UnitInsights remain isolated (candidates for future clustering)",
+            len(isolated_ids),
+        )
+
+    if not clusters:
+        log.info("[MACRO] No new clusters formed from unmatched UnitInsights")
+        return IncrementalDiscoveryResult(
+            new_candidates=[],
+            updates=updates,
+            isolated_ids=isolated_ids,
+        )
+
+    log.info("[MACRO] Found %d new clusters from unmatched UnitInsights", len(clusters))
+
+    # Build ID -> UnitInsight map for unmatched
+    ui_map = {ui.id: ui for ui in unmatched}
 
     # Initialize Bedrock if needed
     if use_llm_naming or generate_descriptions:
@@ -282,8 +528,8 @@ def discover_macro_insights(
     for cluster_ids, centroid in clusters:
         cluster_units = [ui_map[uid] for uid in cluster_ids]
 
-        # Generate label
-        if use_llm_naming and len(cluster_units) > 1:
+        # Generate label (always use LLM for clusters since they have >= 2 members)
+        if use_llm_naming:
             try:
                 label = generate_macro_label(cluster_units, bedrock)
             except Exception as e:
@@ -292,18 +538,13 @@ def discover_macro_insights(
         else:
             label = cluster_units[0].name
 
-        # Generate description
+        # Generate description via LLM for multi-member clusters
         description = None
-        if len(cluster_units) > 1:
-            # Multiple unit insights: generate description via LLM
-            if generate_descriptions and bedrock:
-                try:
-                    description = generate_macro_description(label, cluster_units, bedrock)
-                except Exception as e:
-                    log.warning("[MACRO] Description generation failed: %s", e)
-        else:
-            # Single unit insight: reuse its description
-            description = cluster_units[0].description
+        if generate_descriptions and bedrock:
+            try:
+                description = generate_macro_description(label, cluster_units, bedrock)
+            except Exception as e:
+                log.warning("[MACRO] Description generation failed: %s", e)
 
         candidates.append(
             MacroInsightCandidate(
@@ -314,9 +555,13 @@ def discover_macro_insights(
             )
         )
 
-        log.info("[MACRO] '%s' <- %d unit insights", label, len(cluster_ids))
+        log.info("[MACRO] New cluster '%s' <- %d unit insights", label, len(cluster_ids))
 
-    return candidates
+    return IncrementalDiscoveryResult(
+        new_candidates=candidates,
+        updates=updates,
+        isolated_ids=isolated_ids,
+    )
 
 
 def persist_macro_insights(
@@ -363,8 +608,84 @@ def persist_macro_insights(
     for macro in created:
         session.refresh(macro)
 
-    log.info("[MACRO] Persisted %d MacroInsights", len(created))
+    log.info("[MACRO] Persisted %d new MacroInsights", len(created))
     return created
+
+
+def apply_macro_insight_updates(
+    session: Session,
+    updates: List[MacroInsightUpdate],
+) -> List[MacroInsight]:
+    """
+    Apply updates to existing MacroInsights.
+
+    Injects new UnitInsights into existing MacroInsights and updates centroids.
+
+    Args:
+        session: Database session
+        updates: List of MacroInsightUpdate objects
+
+    Returns:
+        List of updated MacroInsight DB objects
+    """
+    updated_macros: List[MacroInsight] = []
+
+    for update in updates:
+        # Fetch the existing MacroInsight
+        macro = session.query(MacroInsight).get(update.macro_insight_id)
+        if not macro:
+            log.warning(
+                "[MACRO] MacroInsight %d not found, skipping update",
+                update.macro_insight_id,
+            )
+            continue
+
+        # Update the centroid
+        macro.centroid_embedding = update.updated_centroid
+
+        # Link new UnitInsights to this MacroInsight
+        session.query(UnitInsight).filter(
+            UnitInsight.id.in_(update.new_unit_insight_ids)
+        ).update(
+            {UnitInsight.macro_insight_id: macro.id},
+            synchronize_session="fetch",
+        )
+
+        updated_macros.append(macro)
+        log.info(
+            "[MACRO] Updated MacroInsight %d '%s' with %d new UnitInsights",
+            macro.id, macro.name, len(update.new_unit_insight_ids),
+        )
+
+    session.commit()
+
+    # Refresh to get final state
+    for macro in updated_macros:
+        session.refresh(macro)
+
+    if updated_macros:
+        log.info("[MACRO] Updated %d existing MacroInsights", len(updated_macros))
+
+    return updated_macros
+
+
+@dataclass
+class PersistenceResult:
+    """Result of incremental macro insight persistence."""
+
+    # Newly created MacroInsights
+    created: List[MacroInsight]
+
+    # Updated existing MacroInsights
+    updated: List[MacroInsight]
+
+    # UnitInsight IDs that remain unassigned
+    isolated_ids: List[int]
+
+    @property
+    def total_macros_affected(self) -> int:
+        """Total number of MacroInsights created or updated."""
+        return len(self.created) + len(self.updated)
 
 
 def discover_and_persist_macro_insights(
@@ -379,12 +700,16 @@ def discover_and_persist_macro_insights(
     """
     End-to-end macro insight discovery and persistence.
 
+    This function maintains backward compatibility by returning only newly created
+    MacroInsights. For full incremental results including updates, use
+    `discover_and_persist_macro_insights_incremental`.
+
     Steps:
     1. Fetch unassigned UnitInsights from DB
-    2. Cluster by embedding similarity
-    3. Generate labels (and optionally descriptions) via LLM
-    4. Persist MacroInsight records
-    5. Update UnitInsight.macro_insight_id links
+    2. Match against existing MacroInsight centroids (inject if similar)
+    3. Cluster remaining unmatched UnitInsights
+    4. Only create new MacroInsights for clusters with >= 2 members
+    5. Isolated UnitInsights remain unassigned for future clustering
 
     Args:
         session: Database session
@@ -395,9 +720,52 @@ def discover_and_persist_macro_insights(
         bedrock: Optional pre-configured BedrockClient
 
     Returns:
-        List of created MacroInsight DB objects
+        List of newly created MacroInsight DB objects
     """
-    candidates = discover_macro_insights(
+    result = discover_and_persist_macro_insights_incremental(
+        session,
+        unit_insight_ids=unit_insight_ids,
+        similarity_threshold=similarity_threshold,
+        use_llm_naming=use_llm_naming,
+        generate_descriptions=generate_descriptions,
+        bedrock=bedrock,
+    )
+    return result.created
+
+
+def discover_and_persist_macro_insights_incremental(
+    session: Session,
+    *,
+    unit_insight_ids: Optional[List[int]] = None,
+    similarity_threshold: float = 0.72,
+    use_llm_naming: bool = True,
+    generate_descriptions: bool = False,
+    bedrock: Optional[BedrockClient] = None,
+) -> PersistenceResult:
+    """
+    Incremental macro insight discovery and persistence.
+
+    Full incremental workflow:
+    1. Fetch unassigned UnitInsights from DB
+    2. Match against existing MacroInsight centroids
+       - If similarity >= threshold, inject into existing MacroInsight and update centroid
+    3. Cluster remaining unmatched UnitInsights
+    4. Only create new MacroInsights for clusters with >= 2 members
+    5. Isolated UnitInsights remain unassigned for future clustering
+
+    Args:
+        session: Database session
+        unit_insight_ids: Optional list of UnitInsight IDs to process (default: all unassigned)
+        similarity_threshold: Minimum cosine similarity for clustering
+        use_llm_naming: Use LLM to generate labels
+        generate_descriptions: Also generate descriptions via LLM
+        bedrock: Optional pre-configured BedrockClient
+
+    Returns:
+        PersistenceResult with created, updated MacroInsights, and isolated IDs
+    """
+    # Discover candidates and updates
+    discovery_result = discover_macro_insights_incremental(
         session,
         unit_insight_ids=unit_insight_ids,
         similarity_threshold=similarity_threshold,
@@ -406,7 +774,33 @@ def discover_and_persist_macro_insights(
         bedrock=bedrock,
     )
 
-    if not candidates:
-        return []
+    created: List[MacroInsight] = []
+    updated: List[MacroInsight] = []
 
-    return persist_macro_insights(session, candidates)
+    # Apply updates to existing MacroInsights
+    if discovery_result.updates:
+        updated = apply_macro_insight_updates(session, discovery_result.updates)
+
+    # Persist new MacroInsight candidates
+    if discovery_result.new_candidates:
+        created = persist_macro_insights(session, discovery_result.new_candidates)
+
+    # Log summary
+    total_assigned = (
+        sum(len(c.unit_insight_ids) for c in discovery_result.new_candidates)
+        + sum(len(u.new_unit_insight_ids) for u in discovery_result.updates)
+    )
+    log.info(
+        "[MACRO] Summary: %d UnitInsights assigned, %d MacroInsights created, "
+        "%d MacroInsights updated, %d UnitInsights remain isolated",
+        total_assigned,
+        len(created),
+        len(updated),
+        len(discovery_result.isolated_ids),
+    )
+
+    return PersistenceResult(
+        created=created,
+        updated=updated,
+        isolated_ids=discovery_result.isolated_ids,
+    )

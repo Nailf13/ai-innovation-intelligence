@@ -34,12 +34,12 @@ class PodcastEpisode(Base):
 
     podcast_name = Column(String(255), nullable=False)
     episode_title = Column(String(512), nullable=False)
-
-    audio_path = Column(String(1024), nullable=False)
     audio_url = Column(String(1024), nullable=True)
     episode_date = Column(DateTime, nullable=True)
 
-    transcript_path = Column(String(1024), nullable=True)
+    # GCS storage URIs (primary storage)
+    gcs_audio_uri = Column(String(1024), nullable=False)
+    gcs_transcript_uri = Column(String(1024), nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -69,9 +69,11 @@ class Document(Base):
 
     title = Column(String(512), nullable=False)
     source_type = Column(String(64), nullable=True)
-    file_path = Column(String(1024), nullable=False)
-    transcript_path = Column(String(1024), nullable=True)
     document_date = Column(DateTime, nullable=True)
+
+    # GCS storage URIs (primary storage)
+    gcs_document_uri = Column(String(1024), nullable=False)
+    gcs_transcript_uri = Column(String(1024), nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -105,19 +107,32 @@ class UnitInsight(Base):
     # Semantic embedding (name + description)
     embedding = Column(JSONB, nullable=False)
 
-    # Source (exactly one should be set)
+    # Primary source (exactly one should be set)
     episode_id = Column(Integer, ForeignKey("podcast_episodes.id"), nullable=True)
     document_id = Column(Integer, ForeignKey("documents.id"), nullable=True)
+
+    # Additional sources for merged insights
+    # Format: {"episode_ids": [1, 2, 3], "document_ids": [4, 5]}
+    additional_source_ids = Column(JSONB, nullable=True, default=None)
 
     # Semantic grouping
     macro_insight_id = Column(Integer, ForeignKey("macro_insights.id"), nullable=True)
 
+    # Direct cluster assignment (for orphan unit insights)
+    cluster_id = Column(Integer, ForeignKey("clusters.id"), nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
 
     # Relationships
     episode = relationship("PodcastEpisode", back_populates="unit_insights")
     document = relationship("Document", back_populates="unit_insights")
     macro_insight = relationship("MacroInsight", back_populates="unit_insights")
+    cluster = relationship("Cluster", back_populates="unit_insights")
     dimensions = relationship("InsightDimension", back_populates="unit_insight", cascade="all, delete-orphan")
 
 
@@ -197,6 +212,10 @@ class Cluster(Base):
         "MacroInsight",
         back_populates="cluster",
     )
+    unit_insights = relationship(
+        "UnitInsight",
+        back_populates="cluster",
+    )
 
     def __repr__(self) -> str:
         return f"<Cluster id={self.id} name={self.name!r}>"
@@ -240,18 +259,22 @@ class DimensionEvidence(Base):
     __table_args__ = {"extend_existing": True}
 
     id = Column(Integer, primary_key=True, index=True)
-    
+
     dimension_id = Column(Integer, ForeignKey("insight_dimensions.id"), nullable=False)
-    
+
     # The retrieved text chunk
     chunk_text = Column(Text, nullable=False)
-    
+
     # Similarity score from vector search
     similarity_score = Column(Float, nullable=True)
-    
+
     # Source reference (file path, chunk index, etc.)
-    source_ref = Column(String(512), nullable=True)
-    
+    source_ref = Column(String(1024), nullable=True)
+
+    # Metadata from the vector chunk (JSONB for flexibility)
+    # Format: {"start_time": 123.4, "end_time": 145.6, "page": 5, "section": "Introduction"}
+    chunk_metadata = Column(JSONB, nullable=True)
+
     # Relationships
     dimension = relationship("InsightDimension", back_populates="evidence_chunks")
 
@@ -266,9 +289,10 @@ class PodcastChunkVector(Base):
 
     Stores:
     - Chunk text and embedding
-    - Speaker information
     - Timestamps
     - Episode metadata
+
+    Note: source column format is "podcast_name - episode_title"
     """
     __tablename__ = "podcast_chunk_vectors"
 
@@ -281,16 +305,12 @@ class PodcastChunkVector(Base):
     chunk_text = Column(Text, nullable=False)
     embedding = Column(Vector(EMBEDDING_DIM), nullable=False)
 
-    # Speaker info
-    speaker = Column(String(255), nullable=True)
-    speakers = Column(JSONB, nullable=True)  # List of all speakers in chunk
-
     # Timestamps (seconds)
     start_time = Column(Float, nullable=True)
     end_time = Column(Float, nullable=True)
 
-    # Source info
-    source = Column(String(512), nullable=False, index=True)  # Episode identifier
+    # Source info: format is "podcast_name - episode_title"
+    source = Column(String(1024), nullable=False, index=True)
     episode_date = Column(DateTime, nullable=True)
 
     # Timestamps
@@ -324,6 +344,8 @@ class DocumentChunkVector(Base):
     - Chunk text and embedding
     - Page/section information
     - Document metadata
+
+    Note: source column format is the document title
     """
     __tablename__ = "document_chunk_vectors"
 
@@ -340,8 +362,8 @@ class DocumentChunkVector(Base):
     page = Column(Integer, nullable=True)
     section = Column(String(512), nullable=True)
 
-    # Source info
-    source = Column(String(512), nullable=False, index=True)  # Document identifier
+    # Source info: format is the document title
+    source = Column(String(512), nullable=False, index=True)
     document_date = Column(DateTime, nullable=True)
 
     # Timestamps

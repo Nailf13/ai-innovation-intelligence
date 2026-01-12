@@ -6,7 +6,7 @@ Provides two ingestion modes:
 - Single document: ingest_document() - API-ready, with manual upload
 - Batch: index_documents() - folder discovery for bulk processing
 """
-from innovation_intelligence.ingestion.vector_indexing.pipeline import (
+from innovation_intelligence.ingestion.indexing.pipeline import (
     VectorIndexingPipeline,
     DocumentIngestionResult,
     IndexingStats,

@@ -27,19 +27,19 @@ class EpisodeRepository:
         self,
         podcast_name: str,
         episode_title: str,
-        audio_path: Path | str,
+        gcs_audio_uri: str,
         audio_url: Optional[str] = None,
         episode_date: Optional[datetime] = None,
-        transcript_path: Optional[str] = None,
+        gcs_transcript_uri: Optional[str] = None,
     ) -> PodcastEpisode:
-        """Create a new episode record."""
+        """Create a new episode record (GCS-first mode)."""
         episode = PodcastEpisode(
             podcast_name=podcast_name,
             episode_title=episode_title,
-            audio_path=str(audio_path),
             audio_url=audio_url,
             episode_date=episode_date,
-            transcript_path=transcript_path,
+            gcs_audio_uri=gcs_audio_uri,
+            gcs_transcript_uri=gcs_transcript_uri,
         )
         self.session.add(episode)
         self.session.commit()
@@ -100,10 +100,10 @@ class EpisodeRepository:
         return query.all()
 
     def list_with_transcript(self) -> List[PodcastEpisode]:
-        """List episodes that have transcripts."""
+        """List episodes that have transcripts (in GCS)."""
         return (
             self.session.query(PodcastEpisode)
-            .filter(PodcastEpisode.transcript_path.isnot(None))
+            .filter(PodcastEpisode.gcs_transcript_uri.isnot(None))
             .order_by(PodcastEpisode.created_at.desc())
             .all()
         )
@@ -112,7 +112,7 @@ class EpisodeRepository:
         """List episodes that don't have transcripts yet."""
         return (
             self.session.query(PodcastEpisode)
-            .filter(PodcastEpisode.transcript_path.is_(None))
+            .filter(PodcastEpisode.gcs_transcript_uri.is_(None))
             .order_by(PodcastEpisode.created_at.desc())
             .all()
         )
@@ -131,64 +131,62 @@ class EpisodeRepository:
         return self.session.query(PodcastEpisode).count()
 
     def count_with_transcript(self) -> int:
-        """Count episodes with transcripts."""
+        """Count episodes with transcripts (in GCS)."""
         return (
             self.session.query(PodcastEpisode)
-            .filter(PodcastEpisode.transcript_path.isnot(None))
+            .filter(PodcastEpisode.gcs_transcript_uri.isnot(None))
             .count()
         )
+
+    def count(self) -> int:
+        """Count total episodes (alias for count_all)."""
+        return self.count_all()
+
+    def count_with_transcripts(self) -> int:
+        """Count episodes with transcripts (alias for count_with_transcript)."""
+        return self.count_with_transcript()
 
     # ------------------------------------------------------------------
     # Updates
     # ------------------------------------------------------------------
-    def update_transcript_path(
-        self,
-        episode_id: int,
-        transcript_path: str,
-    ) -> PodcastEpisode:
-        """Update the transcript path for an episode."""
-        episode = self.get(episode_id)
-        if episode is None:
-            raise ValueError(f"Episode {episode_id} not found")
-
-        episode.transcript_path = transcript_path
-        self.session.commit()
-        self.session.refresh(episode)
-        return episode
-
-    def update_audio_path(
-        self,
-        episode_id: int,
-        audio_path: str,
-    ) -> PodcastEpisode:
-        """Update the audio path for an episode."""
-        episode = self.get(episode_id)
-        if episode is None:
-            raise ValueError(f"Episode {episode_id} not found")
-
-        episode.audio_path = audio_path
-        self.session.commit()
-        self.session.refresh(episode)
-        return episode
-
     def update(
         self,
         episode_id: int,
-        audio_path: Optional[str] = None,
-        transcript_path: Optional[str] = None,
         episode_date: Optional[datetime] = None,
+        gcs_audio_uri: Optional[str] = None,
+        gcs_transcript_uri: Optional[str] = None,
     ) -> PodcastEpisode:
-        """Update multiple fields on an episode."""
+        """Update fields on an episode (GCS-first mode)."""
         episode = self.get(episode_id)
         if episode is None:
             raise ValueError(f"Episode {episode_id} not found")
 
-        if audio_path is not None:
-            episode.audio_path = audio_path
-        if transcript_path is not None:
-            episode.transcript_path = transcript_path
         if episode_date is not None:
             episode.episode_date = episode_date
+        if gcs_audio_uri is not None:
+            episode.gcs_audio_uri = gcs_audio_uri
+        if gcs_transcript_uri is not None:
+            episode.gcs_transcript_uri = gcs_transcript_uri
+
+        self.session.commit()
+        self.session.refresh(episode)
+        return episode
+
+    def update_gcs_uris(
+        self,
+        episode_id: int,
+        gcs_audio_uri: Optional[str] = None,
+        gcs_transcript_uri: Optional[str] = None,
+    ) -> PodcastEpisode:
+        """Update GCS URIs for an episode."""
+        episode = self.get(episode_id)
+        if episode is None:
+            raise ValueError(f"Episode {episode_id} not found")
+
+        if gcs_audio_uri is not None:
+            episode.gcs_audio_uri = gcs_audio_uri
+        if gcs_transcript_uri is not None:
+            episode.gcs_transcript_uri = gcs_transcript_uri
 
         self.session.commit()
         self.session.refresh(episode)
@@ -202,11 +200,12 @@ class EpisodeRepository:
         podcast_name: str,
         episode_title: str,
         audio_url: str,
-        audio_path: Optional[Path | str] = None,
         episode_date: Optional[datetime] = None,
+        gcs_audio_uri: Optional[str] = None,
+        gcs_transcript_uri: Optional[str] = None,
     ) -> tuple[PodcastEpisode, bool]:
         """
-        Get existing episode or create new one.
+        Get existing episode or create new one (GCS-first mode).
 
         Returns:
             Tuple of (episode, created) where created is True if new.
@@ -225,8 +224,9 @@ class EpisodeRepository:
         episode = self.create(
             podcast_name=podcast_name,
             episode_title=episode_title,
-            audio_path=str(audio_path) if audio_path else "",
             audio_url=audio_url,
             episode_date=episode_date,
+            gcs_audio_uri=gcs_audio_uri,
+            gcs_transcript_uri=gcs_transcript_uri,
         )
         return episode, True

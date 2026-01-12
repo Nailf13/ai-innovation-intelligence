@@ -8,11 +8,12 @@ Usage:
     python -m innovation_intelligence.cli.analyze run --skip-extraction  # From existing insights
     python -m innovation_intelligence.cli.analyze run --clustering-only  # Only clustering stages
     python -m innovation_intelligence.cli.analyze stats             # Show statistics
+
+GCS-first mode: All transcripts must be stored in GCS.
 """
 import argparse
 import json
 import sys
-from pathlib import Path
 
 from innovation_intelligence.config import settings
 from innovation_intelligence.logger import get_logger
@@ -47,11 +48,6 @@ def cmd_run(args):
             continue_on_error=not args.fail_fast,
         )
 
-        # Determine transcripts directory
-        transcripts_dir = None
-        if args.transcripts_dir:
-            transcripts_dir = Path(args.transcripts_dir)
-
         print("=" * 60)
         print("INNOVATION INTELLIGENCE - ANALYSIS PIPELINE")
         print("=" * 60)
@@ -84,7 +80,6 @@ def cmd_run(args):
             print("Running full pipeline...")
             result = run_full_analysis(
                 session,
-                transcripts_dir=transcripts_dir,
                 config=config,
             )
 
@@ -246,11 +241,6 @@ Examples:
     # Run command
     run_parser = subparsers.add_parser("run", help="Run analysis pipeline")
     run_parser.add_argument(
-        "--transcripts-dir",
-        type=str,
-        help="Directory containing transcript files",
-    )
-    run_parser.add_argument(
         "--skip-extraction",
         action="store_true",
         help="Skip insight extraction (use existing insights)",
@@ -289,8 +279,8 @@ Examples:
     run_parser.add_argument(
         "--cluster-threshold",
         type=float,
-        default=0.75,
-        help="Similarity threshold for strategic clustering (default: 0.75)",
+        default=0.5,
+        help="Similarity threshold for strategic clustering (default: 0.5)",
     )
     run_parser.add_argument(
         "--no-llm-naming",

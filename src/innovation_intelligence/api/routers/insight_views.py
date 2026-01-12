@@ -71,7 +71,7 @@ def list_unit_insights(
         result_insights.append(UnitInsightResponse(
             id=ui.id, name=ui.name, description=ui.description, type=ui.type,
             source_type=src_type, source_id=src_id,
-            macro_insight_id=ui.macro_insight_id, created_at=None,
+            macro_insight_id=ui.macro_insight_id, created_at=ui.created_at,
         ))
     return UnitInsightListResponse(insights=result_insights, count=total)
 
@@ -79,6 +79,8 @@ def list_unit_insights(
 @router.get("/unit/{insight_id}", response_model=UnitInsightResponse)
 def get_unit_insight(insight_id: int, db: Session = Depends(get_db)):
     """Get a specific unit insight with its dimensions."""
+    from innovation_intelligence.api.schemas import EvidenceItem
+
     insight = db.get(UnitInsight, insight_id)
     if not insight:
         raise HTTPException(status_code=404, detail="Unit insight not found")
@@ -86,15 +88,30 @@ def get_unit_insight(insight_id: int, db: Session = Depends(get_db)):
     dimension_responses = []
     for dim in dimensions:
         evidence = db.query(DimensionEvidence).filter(DimensionEvidence.dimension_id == dim.id).all()
+        evidence_items = []
+        for e in evidence:
+            # Extract metadata from JSONB column
+            metadata = e.chunk_metadata or {}
+            evidence_items.append(
+                EvidenceItem(
+                    text=e.chunk_text,
+                    source_ref=e.source_ref,
+                    similarity_score=e.similarity_score,
+                    start_time=metadata.get("start_time"),
+                    end_time=metadata.get("end_time"),
+                    page=metadata.get("page"),
+                    section=metadata.get("section"),
+                )
+            )
         dimension_responses.append(DimensionResponse(
             id=dim.id, dimension_type=dim.dimension_type, value=dim.value,
-            confidence=dim.confidence, evidence=[e.chunk_text for e in evidence],
+            confidence=dim.confidence, evidence=evidence_items,
         ))
     src_type, src_id = _get_source_info(insight)
     return UnitInsightResponse(
         id=insight.id, name=insight.name, description=insight.description, type=insight.type,
         source_type=src_type, source_id=src_id,
-        macro_insight_id=insight.macro_insight_id, dimensions=dimension_responses, created_at=None,
+        macro_insight_id=insight.macro_insight_id, dimensions=dimension_responses, created_at=insight.created_at,
     )
 
 
@@ -129,9 +146,9 @@ def get_macro_insight(macro_id: int, db: Session = Depends(get_db)):
         src_type, src_id = _get_source_info(ui)
         unit_insights.append(UnitInsightResponse(id=ui.id, name=ui.name, description=ui.description, type=ui.type,
             source_type=src_type, source_id=src_id,
-            macro_insight_id=ui.macro_insight_id, created_at=None))
+            macro_insight_id=ui.macro_insight_id, created_at=ui.created_at))
     return MacroInsightResponse(id=macro.id, name=macro.name, description=macro.description, cluster_id=macro.cluster_id,
-        unit_insight_count=len(unit_insights), unit_insights=unit_insights, created_at=None)
+        unit_insight_count=len(unit_insights), unit_insights=unit_insights, created_at=macro.created_at)
 
 
 @router.get("/clusters", response_model=ClusterListResponse)
@@ -168,15 +185,122 @@ def search_insights(request: SearchRequest, db: Session = Depends(get_db)):
 
 @router.get("/hierarchy")
 def get_insight_hierarchy(db: Session = Depends(get_db)):
-    """Get the full insight hierarchy: clusters -> macro insights -> unit insights."""
-    clusters = db.query(Cluster).options(joinedload(Cluster.macro_insights).joinedload(MacroInsight.unit_insights)).all()
-    unassigned_macros = db.query(MacroInsight).filter(MacroInsight.cluster_id.is_(None)).options(joinedload(MacroInsight.unit_insights)).all()
-    orphan_units = db.query(UnitInsight).filter(UnitInsight.macro_insight_id.is_(None)).all()
+    """
+    Get the full insight hierarchy: clusters -> macro insights -> unit insights.
+
+    Now includes orphan unit insights with direct cluster assignments:
+    - Clusters now include both macro insights AND orphan unit insights
+    - orphan_unit_insights only contains truly unassigned insights (no macro AND no cluster)
+    """
+    # Fetch clusters with macro insights and their unit insights
+    clusters = db.query(Cluster).options(
+        joinedload(Cluster.macro_insights).joinedload(MacroInsight.unit_insights)
+    ).all()
+
+    # Fetch unassigned macro insights (no cluster)
+    unassigned_macros = db.query(MacroInsight).filter(
+        MacroInsight.cluster_id.is_(None)
+    ).options(joinedload(MacroInsight.unit_insights)).all()
+
+    # Fetch truly orphan unit insights (no macro AND no cluster)
+    truly_orphan_units = db.query(UnitInsight).filter(
+        UnitInsight.macro_insight_id.is_(None),
+        UnitInsight.cluster_id.is_(None)
+    ).all()
+
+    # Build cluster hierarchy with both macro insights and orphan unit insights
+    cluster_data = []
+    for c in clusters:
+        # Get orphan unit insights directly assigned to this cluster
+        orphan_units_in_cluster = db.query(UnitInsight).filter(
+            UnitInsight.cluster_id == c.id,
+            UnitInsight.macro_insight_id.is_(None)
+        ).all()
+
+        cluster_data.append({
+            "id": c.id,
+            "name": c.name,
+            "description": c.description,
+            "macro_insights": [
+                {
+                    "id": m.id,
+                    "name": m.name,
+                    "description": m.description,
+                    "unit_insights": [
+                        {"id": ui.id, "name": ui.name, "type": ui.type}
+                        for ui in m.unit_insights
+                    ]
+                }
+                for m in c.macro_insights
+            ],
+            "orphan_unit_insights": [
+                {"id": ui.id, "name": ui.name, "type": ui.type}
+                for ui in orphan_units_in_cluster
+            ]
+        })
+
     return {
-        "clusters": [{"id": c.id, "name": c.name, "description": c.description, "macro_insights": [
-            {"id": m.id, "name": m.name, "description": m.description, "unit_insights": [
-                {"id": ui.id, "name": ui.name, "type": ui.type} for ui in m.unit_insights]} for m in c.macro_insights]} for c in clusters],
-        "unassigned_macro_insights": [{"id": m.id, "name": m.name, "description": m.description, "unit_insights": [
-            {"id": ui.id, "name": ui.name, "type": ui.type} for ui in m.unit_insights]} for m in unassigned_macros],
-        "orphan_unit_insights": [{"id": ui.id, "name": ui.name, "type": ui.type} for ui in orphan_units],
+        "clusters": cluster_data,
+        "unassigned_macro_insights": [
+            {
+                "id": m.id,
+                "name": m.name,
+                "description": m.description,
+                "unit_insights": [
+                    {"id": ui.id, "name": ui.name, "type": ui.type}
+                    for ui in m.unit_insights
+                ]
+            }
+            for m in unassigned_macros
+        ],
+        "orphan_unit_insights": [
+            {"id": ui.id, "name": ui.name, "type": ui.type}
+            for ui in truly_orphan_units
+        ],
+    }
+
+
+@router.get("/visualization-data")
+def get_visualization_data(db: Session = Depends(get_db)):
+    """
+    Get unit insights with their dimension data for visualization.
+
+    Returns separate datasets for trends and stakes with their dimension values.
+    """
+    # Fetch all unit insights with dimensions
+    unit_insights = db.query(UnitInsight).options(
+        joinedload(UnitInsight.dimensions)
+    ).all()
+
+    trends = []
+    stakes = []
+
+    for insight in unit_insights:
+        # Create dimension map
+        dim_map = {d.dimension_type: d.value for d in insight.dimensions}
+
+        if insight.type == "trend":
+            # For trends: expectation (y), progress (x), adoption (color)
+            trends.append({
+                "id": insight.id,
+                "name": insight.name,
+                "description": insight.description,
+                "expectation": dim_map.get("expectation"),
+                "progress": dim_map.get("progress"),
+                "adoption": dim_map.get("adoption"),
+            })
+        elif insight.type == "health_stake":
+            # For stakes: criticality (y), urgency (x), actionability (color)
+            stakes.append({
+                "id": insight.id,
+                "name": insight.name,
+                "description": insight.description,
+                "criticality": dim_map.get("criticality"),
+                "urgency": dim_map.get("urgency"),
+                "actionability": dim_map.get("actionability"),
+            })
+
+    return {
+        "trends": trends,
+        "stakes": stakes,
     }

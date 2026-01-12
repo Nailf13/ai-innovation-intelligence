@@ -6,6 +6,7 @@ This module handles:
 - Lazy loading and caching of cluster embeddings
 - Database persistence of cluster assignments
 - Support for dynamic "Other / Emerging" cluster
+- Incremental updates when MacroInsight centroids change
 
 The clustering hierarchy:
     UnitInsight → MacroInsight → Cluster (strategic)
@@ -13,6 +14,12 @@ The clustering hierarchy:
 Strategic clusters are predefined high-level categories. MacroInsights that
 don't fit any predefined cluster (below similarity threshold) are assigned
 to "Other / Emerging".
+
+Incremental update process:
+- When MacroInsight centroids are updated (new UnitInsights injected), re-evaluate
+  their cluster assignments
+- Track which assignments changed vs stayed the same
+- Support both newly created and updated MacroInsights in a single operation
 """
 from __future__ import annotations
 
@@ -25,7 +32,7 @@ import numpy as np
 from sqlalchemy.orm import Session
 
 from innovation_intelligence.analysis.insights.embedder import embed_text
-from innovation_intelligence.db.models import Cluster, MacroInsight
+from innovation_intelligence.db.models import Cluster, MacroInsight, UnitInsight
 from innovation_intelligence.logger import get_logger
 
 log = get_logger(__name__)
@@ -34,7 +41,7 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------
-DEFAULT_SIMILARITY_THRESHOLD = 0.75
+DEFAULT_SIMILARITY_THRESHOLD = 0.5
 OTHER_CLUSTER_NAME = "Other"
 
 
@@ -49,28 +56,37 @@ class ClusterDefinitionType(str, Enum):
 # ---------------------------------------------------------------------
 STRATEGIC_CLUSTER_DEFINITIONS: Dict[str, str] = {
     "Metabolic Health & Lifestyle-Driven Conditions": (
-        "diabetes obesity nutrition metabolic insulin blood sugar weight management "
-        "cardiovascular lipid cholesterol dietary interventions"
+        "metabolic health diabetes obesity overweight insulin resistance blood sugar glucose "
+        "weight management weight loss appetite satiety nutrition diet lifestyle chronic disease "
+        "cardiovascular cholesterol lipids triglycerides hypertension prevention metabolic fitness "
+        "protein fiber low sugar low carb glycemic index biohacking"
     ),
     "Mental, Emotional & Cognitive Well-Being": (
-        "mental health cognition stress focus mood psychology depression anxiety "
-        "brain health cognitive function emotional resilience mindfulness"
+        "mental health cognition cognitive brain focus memory mood stress anxiety depression burnout "
+        "sleep relaxation mindfulness emotional resilience psychology wellbeing nervous system "
+        "neurotransmitters magnesium adaptogens omega-3 gut brain axis stress management"
     ),
     "Women's Health & Hormonal Balance": (
-        "female health hormones menstrual menopause fertility pregnancy reproductive "
-        "estrogen progesterone perimenopause endocrine"
+        "women health female health hormones hormonal balance menstrual cycle menopause perimenopause "
+        "fertility pregnancy postpartum reproductive health estrogen progesterone pcos endometriosis "
+        "bone density iron deficiency maternal health lifecycle endocrine"
     ),
     "Healthy Aging, Longevity & Vitality": (
-        "longevity aging lifespan vitality healthspan anti-aging cellular health "
-        "senescence regeneration telomeres NAD sirtuins"
+        "aging longevity lifespan healthspan vitality senior elderly frailty sarcopenia autonomy "
+        "anti aging prevention cellular health regeneration senescence telomeres NAD sirtuins "
+        "cognitive decline mobility bone health muscle mass independence"
     ),
     "Immunity & Gut Health": (
-        "immunity gut microbiome inflammation immune system probiotics prebiotics "
-        "intestinal barrier autoimmune infection resistance"
+        "immunity immune system gut health microbiome digestion digestive health inflammation "
+        "probiotics prebiotics synbiotics fermented intestinal barrier leaky gut "
+        "infection resistance respiratory immunity vitamins zinc vitamin D vitamin C "
+        "autoimmune sensitivities microbiota"
     ),
     "Physical Resilience & Performance": (
-        "exercise fitness strength recovery performance endurance muscle training "
-        "sports rehabilitation physical activity mobility"
+        "physical resilience performance fitness strength endurance stamina recovery mobility "
+        "coordination posture balance motor skills musculoskeletal joints tendons bones "
+        "physical development children youth adults training rehabilitation injury prevention "
+        "sedentary lifestyle body literacy functional capacity"
     ),
 }
 
@@ -97,6 +113,23 @@ class ClusterAssignment:
 
 
 @dataclass
+class ClusterAssignmentChange:
+    """Represents a change in cluster assignment for a MacroInsight."""
+    macro_insight_id: int
+    macro_insight_label: str
+    old_cluster_name: Optional[str]
+    new_cluster_name: str
+    similarity_score: float
+    is_new_assignment: bool  # True if no previous cluster assignment
+    is_changed: bool  # True if cluster changed (including None -> cluster)
+
+    @property
+    def is_other(self) -> bool:
+        """Check if assigned to Other cluster."""
+        return self.new_cluster_name == OTHER_CLUSTER_NAME
+
+
+@dataclass
 class ClusteringResult:
     """Aggregate result of a clustering operation."""
     assignments: List[ClusterAssignment] = field(default_factory=list)
@@ -115,6 +148,73 @@ class ClusteringResult:
         if assignment.cluster_name not in self.clusters_used:
             self.clusters_used[assignment.cluster_name] = 0
         self.clusters_used[assignment.cluster_name] += 1
+
+
+@dataclass
+class IncrementalClusteringResult:
+    """Result of an incremental clustering update operation."""
+
+    # All assignment changes (new + updated + unchanged)
+    changes: List[ClusterAssignmentChange] = field(default_factory=list)
+
+    # Clusters used and their counts
+    clusters_used: Dict[str, int] = field(default_factory=dict)
+
+    # Counters
+    total_processed: int = 0
+    total_new_assignments: int = 0
+    total_changed: int = 0
+    total_unchanged: int = 0
+    total_assigned_to_other: int = 0
+
+    def add_change(self, change: ClusterAssignmentChange) -> None:
+        """Add a change and update counters."""
+        self.changes.append(change)
+        self.total_processed += 1
+
+        if change.is_new_assignment:
+            self.total_new_assignments += 1
+
+        if change.is_changed:
+            self.total_changed += 1
+        else:
+            self.total_unchanged += 1
+
+        if change.is_other:
+            self.total_assigned_to_other += 1
+
+        if change.new_cluster_name not in self.clusters_used:
+            self.clusters_used[change.new_cluster_name] = 0
+        self.clusters_used[change.new_cluster_name] += 1
+
+    @property
+    def assignments(self) -> List[ClusterAssignment]:
+        """Convert changes to ClusterAssignment for backward compatibility."""
+        return [
+            ClusterAssignment(
+                macro_insight_id=c.macro_insight_id,
+                macro_insight_label=c.macro_insight_label,
+                cluster_name=c.new_cluster_name,
+                similarity_score=c.similarity_score,
+                is_other=c.is_other,
+            )
+            for c in self.changes
+        ]
+
+    def to_clustering_result(self) -> ClusteringResult:
+        """Convert to basic ClusteringResult for backward compatibility."""
+        result = ClusteringResult()
+        for change in self.changes:
+            result.add_assignment(
+                ClusterAssignment(
+                    macro_insight_id=change.macro_insight_id,
+                    macro_insight_label=change.macro_insight_label,
+                    cluster_name=change.new_cluster_name,
+                    similarity_score=change.similarity_score,
+                    is_other=change.is_other,
+                )
+            )
+        return result
 
 
 # ---------------------------------------------------------------------
@@ -326,6 +426,52 @@ def assign_macro_insight(
     )
 
 
+def assign_macro_insight_with_change_tracking(
+    macro: MacroInsight,
+    cluster_cache: ClusterEmbeddingCache,
+    session: Session,
+    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+) -> ClusterAssignmentChange:
+    """
+    Assign a macro insight to a cluster and track changes from previous assignment.
+
+    Args:
+        macro: MacroInsight database model
+        cluster_cache: Cache containing cluster embeddings
+        session: SQLAlchemy session (to resolve current cluster name)
+        similarity_threshold: Minimum similarity for cluster assignment
+
+    Returns:
+        ClusterAssignmentChange with old/new cluster info
+
+    Raises:
+        ValueError: If macro insight has no centroid embedding
+    """
+    # Get current cluster name (if any)
+    old_cluster_name: Optional[str] = None
+    if macro.cluster_id is not None:
+        current_cluster = session.query(Cluster).get(macro.cluster_id)
+        if current_cluster:
+            old_cluster_name = current_cluster.name
+
+    # Compute new assignment
+    assignment = assign_macro_insight(macro, cluster_cache, similarity_threshold)
+
+    # Determine if this is a change
+    is_new_assignment = old_cluster_name is None
+    is_changed = old_cluster_name != assignment.cluster_name
+
+    return ClusterAssignmentChange(
+        macro_insight_id=macro.id,
+        macro_insight_label=macro.name,
+        old_cluster_name=old_cluster_name,
+        new_cluster_name=assignment.cluster_name,
+        similarity_score=assignment.similarity_score,
+        is_new_assignment=is_new_assignment,
+        is_changed=is_changed,
+    )
+
+
 # ---------------------------------------------------------------------
 # Batch assignment
 # ---------------------------------------------------------------------
@@ -513,6 +659,239 @@ def assign_and_persist_macro_insights(
 
 
 # ---------------------------------------------------------------------
+# Incremental update API
+# ---------------------------------------------------------------------
+def assign_macro_insights_incremental(
+    session: Session,
+    macro_insights: Sequence[MacroInsight],
+    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    cluster_cache: Optional[ClusterEmbeddingCache] = None,
+) -> IncrementalClusteringResult:
+    """
+    Assign macro insights to clusters with change tracking.
+
+    This function tracks whether assignments changed from previous values,
+    useful for incremental updates when MacroInsight centroids have been updated.
+
+    Args:
+        session: SQLAlchemy session (needed to resolve current cluster names)
+        macro_insights: Sequence of MacroInsight database models
+        similarity_threshold: Minimum cosine similarity for cluster assignment
+        cluster_cache: Optional custom cache (uses singleton by default)
+
+    Returns:
+        IncrementalClusteringResult with change tracking information
+    """
+    if not macro_insights:
+        log.info("[CLUSTER] No macro insights to process")
+        return IncrementalClusteringResult()
+
+    cache = cluster_cache or get_cluster_embedding_cache()
+    result = IncrementalClusteringResult()
+
+    log.info(
+        "[CLUSTER] Incremental assignment of %d macro insights (threshold=%.2f)",
+        len(macro_insights),
+        similarity_threshold,
+    )
+
+    for macro in macro_insights:
+        try:
+            change = assign_macro_insight_with_change_tracking(
+                macro, cache, session, similarity_threshold
+            )
+            result.add_change(change)
+
+            # Log with change indication
+            change_indicator = ""
+            if change.is_new_assignment:
+                change_indicator = " [NEW]"
+            elif change.is_changed:
+                change_indicator = f" [CHANGED from {change.old_cluster_name}]"
+
+            log.info(
+                "[CLUSTER] '%s' → %s (%.3f)%s%s",
+                change.macro_insight_label,
+                change.new_cluster_name,
+                change.similarity_score,
+                " [OTHER]" if change.is_other else "",
+                change_indicator,
+            )
+        except ValueError as e:
+            log.warning("[CLUSTER] Skipping macro insight: %s", e)
+            continue
+
+    log.info(
+        "[CLUSTER] Incremental completed: %d processed, %d new, %d changed, %d unchanged, %d to 'Other'",
+        result.total_processed,
+        result.total_new_assignments,
+        result.total_changed,
+        result.total_unchanged,
+        result.total_assigned_to_other,
+    )
+
+    return result
+
+
+def persist_incremental_cluster_assignments(
+    session: Session,
+    result: IncrementalClusteringResult,
+    only_changed: bool = False,
+) -> Dict[str, Cluster]:
+    """
+    Persist incremental cluster assignments to the database.
+
+    Args:
+        session: SQLAlchemy session
+        result: IncrementalClusteringResult from assign_macro_insights_incremental
+        only_changed: If True, only persist assignments that actually changed
+
+    Returns:
+        Dictionary mapping cluster names to Cluster models
+    """
+    changes_to_persist = result.changes
+    if only_changed:
+        changes_to_persist = [c for c in result.changes if c.is_changed]
+
+    if not changes_to_persist:
+        log.info("[CLUSTER] No changes to persist")
+        return {}
+
+    # Get or create all required clusters
+    cluster_map: Dict[str, Cluster] = {}
+    cluster_names_needed = set(c.new_cluster_name for c in changes_to_persist)
+    for cluster_name in cluster_names_needed:
+        cluster_map[cluster_name] = get_or_create_cluster(session, cluster_name)
+
+    # Update macro insight cluster assignments
+    for change in changes_to_persist:
+        cluster = cluster_map[change.new_cluster_name]
+        session.query(MacroInsight).filter(
+            MacroInsight.id == change.macro_insight_id
+        ).update(
+            {MacroInsight.cluster_id: cluster.id},
+            synchronize_session="fetch",
+        )
+
+    session.commit()
+
+    log.info(
+        "[CLUSTER] Persisted %d assignments (%d changed) to %d clusters",
+        len(changes_to_persist),
+        sum(1 for c in changes_to_persist if c.is_changed),
+        len(cluster_map),
+    )
+
+    return cluster_map
+
+
+def update_cluster_assignments(
+    session: Session,
+    macro_insight_ids: List[int],
+    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+) -> IncrementalClusteringResult:
+    """
+    Re-evaluate and update cluster assignments for specific MacroInsights.
+
+    Use this when MacroInsight centroids have been updated (e.g., after new
+    UnitInsights were injected). Only assignments that actually change will
+    be persisted.
+
+    Args:
+        session: SQLAlchemy database session
+        macro_insight_ids: List of MacroInsight IDs to re-evaluate
+        similarity_threshold: Minimum similarity for cluster assignment
+
+    Returns:
+        IncrementalClusteringResult with change tracking information
+    """
+    if not macro_insight_ids:
+        log.info("[CLUSTER] No MacroInsight IDs provided for update")
+        return IncrementalClusteringResult()
+
+    # Fetch the specified MacroInsights (regardless of current cluster assignment)
+    macro_insights = session.query(MacroInsight).filter(
+        MacroInsight.id.in_(macro_insight_ids)
+    ).all()
+
+    if not macro_insights:
+        log.info("[CLUSTER] No MacroInsights found for provided IDs")
+        return IncrementalClusteringResult()
+
+    log.info(
+        "[CLUSTER] Re-evaluating cluster assignments for %d MacroInsights",
+        len(macro_insights),
+    )
+
+    # Perform incremental assignment with change tracking
+    result = assign_macro_insights_incremental(
+        session, macro_insights, similarity_threshold
+    )
+
+    # Only persist changes (not unchanged assignments)
+    persist_incremental_cluster_assignments(session, result, only_changed=True)
+
+    return result
+
+
+def assign_and_persist_macro_insights_incremental(
+    session: Session,
+    macro_insight_ids: Optional[List[int]] = None,
+    include_assigned: bool = False,
+    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+) -> IncrementalClusteringResult:
+    """
+    End-to-end incremental macro insight clustering and persistence.
+
+    This is the incremental version of assign_and_persist_macro_insights that
+    tracks changes and can optionally re-evaluate already-assigned MacroInsights.
+
+    Args:
+        session: SQLAlchemy database session
+        macro_insight_ids: Optional list of specific IDs to process
+                          (default: all unassigned, or all if include_assigned=True)
+        include_assigned: If True, also process already-assigned MacroInsights
+        similarity_threshold: Minimum similarity for cluster assignment
+
+    Returns:
+        IncrementalClusteringResult with change tracking information
+    """
+    # Build query
+    query = session.query(MacroInsight)
+
+    if not include_assigned:
+        query = query.filter(MacroInsight.cluster_id.is_(None))
+
+    if macro_insight_ids is not None:
+        query = query.filter(MacroInsight.id.in_(macro_insight_ids))
+
+    macro_insights = query.all()
+
+    if not macro_insights:
+        log.info("[CLUSTER] No MacroInsights found to process")
+        return IncrementalClusteringResult()
+
+    # Perform incremental assignment
+    result = assign_macro_insights_incremental(
+        session, macro_insights, similarity_threshold
+    )
+
+    # Persist all assignments (including unchanged, for consistency)
+    persist_incremental_cluster_assignments(session, result, only_changed=False)
+
+    # Log summary
+    log.info(
+        "[CLUSTER] Summary: %d processed, %d new assignments, %d changed, %d unchanged",
+        result.total_processed,
+        result.total_new_assignments,
+        result.total_changed - result.total_new_assignments,  # Changed excludes new
+        result.total_unchanged,
+    )
+
+    return result
+
+
+# ---------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------
 def get_cluster_statistics(session: Session) -> Dict[str, int]:
@@ -581,3 +960,230 @@ def reassign_other_cluster(
         macro_insight_ids=[m.id for m in macro_insights],
         similarity_threshold=new_threshold,
     )
+
+
+# ---------------------------------------------------------------------
+# Orphan UnitInsight clustering
+# ---------------------------------------------------------------------
+@dataclass
+class UnitInsightAssignment:
+    """Result of assigning a unit insight to a strategic cluster."""
+    unit_insight_id: int
+    unit_insight_name: str
+    cluster_name: str
+    similarity_score: float
+    is_other: bool = False
+
+
+@dataclass
+class UnitInsightClusteringResult:
+    """Aggregate result of a unit insight clustering operation."""
+    assignments: List[UnitInsightAssignment] = field(default_factory=list)
+    clusters_used: Dict[str, int] = field(default_factory=dict)
+    total_processed: int = 0
+    total_assigned_to_other: int = 0
+
+    def add_assignment(self, assignment: UnitInsightAssignment) -> None:
+        """Add an assignment and update counters."""
+        self.assignments.append(assignment)
+        self.total_processed += 1
+
+        if assignment.is_other:
+            self.total_assigned_to_other += 1
+
+        if assignment.cluster_name not in self.clusters_used:
+            self.clusters_used[assignment.cluster_name] = 0
+        self.clusters_used[assignment.cluster_name] += 1
+
+
+def assign_unit_insight(
+    unit_insight: UnitInsight,
+    cluster_cache: ClusterEmbeddingCache,
+    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+) -> UnitInsightAssignment:
+    """
+    Assign a single orphan unit insight to a strategic cluster.
+
+    Args:
+        unit_insight: UnitInsight database model
+        cluster_cache: Cache containing cluster embeddings
+        similarity_threshold: Minimum similarity for cluster assignment
+
+    Returns:
+        UnitInsightAssignment with assignment details
+
+    Raises:
+        ValueError: If unit insight has no embedding
+    """
+    if unit_insight.embedding is None:
+        raise ValueError(f"UnitInsight {unit_insight.id} has no embedding")
+
+    # Get and normalize the unit insight embedding
+    unit_vec = np.array(unit_insight.embedding, dtype=np.float32)
+    unit_vec = normalize_vector(unit_vec)
+
+    # Find best cluster
+    cluster_name, score, is_other = find_best_cluster(
+        unit_vec,
+        cluster_cache.embeddings,
+        similarity_threshold,
+    )
+
+    return UnitInsightAssignment(
+        unit_insight_id=unit_insight.id,
+        unit_insight_name=unit_insight.name,
+        cluster_name=cluster_name,
+        similarity_score=score,
+        is_other=is_other,
+    )
+
+
+def assign_orphan_unit_insights_to_clusters(
+    unit_insights: Sequence[UnitInsight],
+    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    cluster_cache: Optional[ClusterEmbeddingCache] = None,
+) -> UnitInsightClusteringResult:
+    """
+    Assign orphan unit insights (without macro insight) to strategic clusters.
+
+    This function assigns unit insights directly to strategic clusters when they
+    couldn't be grouped into macro insights (isolated insights).
+
+    Args:
+        unit_insights: Sequence of UnitInsight database models
+        similarity_threshold: Minimum cosine similarity for cluster assignment
+        cluster_cache: Optional custom cache (uses singleton by default)
+
+    Returns:
+        UnitInsightClusteringResult with all assignments and statistics
+    """
+    if not unit_insights:
+        log.info("[CLUSTER] No orphan unit insights to process")
+        return UnitInsightClusteringResult()
+
+    cache = cluster_cache or get_cluster_embedding_cache()
+    result = UnitInsightClusteringResult()
+
+    log.info(
+        "[CLUSTER] Assigning %d orphan unit insights (threshold=%.2f)",
+        len(unit_insights),
+        similarity_threshold,
+    )
+
+    for unit_insight in unit_insights:
+        try:
+            assignment = assign_unit_insight(unit_insight, cache, similarity_threshold)
+            result.add_assignment(assignment)
+
+            log.info(
+                "[CLUSTER] '%s' → %s (%.3f)%s",
+                assignment.unit_insight_name[:50],
+                assignment.cluster_name,
+                assignment.similarity_score,
+                " [OTHER]" if assignment.is_other else "",
+            )
+        except ValueError as e:
+            log.warning("[CLUSTER] Skipping unit insight: %s", e)
+            continue
+
+    log.info(
+        "[CLUSTER] Completed: %d orphan unit insights processed, %d to 'Other'",
+        result.total_processed,
+        result.total_assigned_to_other,
+    )
+
+    return result
+
+
+def persist_unit_insight_cluster_assignments(
+    session: Session,
+    result: UnitInsightClusteringResult,
+) -> Dict[str, Cluster]:
+    """
+    Persist unit insight cluster assignments to the database.
+
+    Updates UnitInsight.cluster_id for all assignments.
+
+    Args:
+        session: SQLAlchemy session
+        result: UnitInsightClusteringResult from assign_orphan_unit_insights_to_clusters
+
+    Returns:
+        Dictionary mapping cluster names to Cluster models
+    """
+    if not result.assignments:
+        return {}
+
+    # Get or create all required clusters
+    cluster_map: Dict[str, Cluster] = {}
+    for cluster_name in result.clusters_used.keys():
+        cluster_map[cluster_name] = get_or_create_cluster(session, cluster_name)
+
+    # Update unit insight cluster assignments
+    for assignment in result.assignments:
+        cluster = cluster_map[assignment.cluster_name]
+        session.query(UnitInsight).filter(
+            UnitInsight.id == assignment.unit_insight_id
+        ).update(
+            {UnitInsight.cluster_id: cluster.id},
+            synchronize_session="fetch",
+        )
+
+    session.commit()
+
+    log.info(
+        "[CLUSTER] Persisted %d unit insight assignments to %d clusters",
+        len(result.assignments),
+        len(cluster_map),
+    )
+
+    return cluster_map
+
+
+def assign_and_persist_orphan_unit_insights(
+    session: Session,
+    unit_insight_ids: Optional[List[int]] = None,
+    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+) -> UnitInsightClusteringResult:
+    """
+    End-to-end orphan unit insight clustering and persistence.
+
+    This is the main entry point for clustering orphan unit insights
+    (those without a macro insight) directly to strategic clusters.
+
+    Steps:
+    1. Fetch orphan UnitInsights (no macro_insight_id) from database
+    2. Compute cluster assignments using embedding similarity
+    3. Create/update Cluster records
+    4. Update UnitInsight.cluster_id links
+
+    Args:
+        session: SQLAlchemy database session
+        unit_insight_ids: Optional list of specific IDs to process
+                         (default: all orphan unit insights)
+        similarity_threshold: Minimum similarity for cluster assignment
+
+    Returns:
+        UnitInsightClusteringResult with assignments and statistics
+    """
+    # Build query for orphan unit insights (no macro insight assigned)
+    query = session.query(UnitInsight).filter(
+        UnitInsight.macro_insight_id.is_(None)
+    )
+
+    if unit_insight_ids is not None:
+        query = query.filter(UnitInsight.id.in_(unit_insight_ids))
+
+    unit_insights = query.all()
+
+    if not unit_insights:
+        log.info("[CLUSTER] No orphan UnitInsights found")
+        return UnitInsightClusteringResult()
+
+    # Perform assignment
+    result = assign_orphan_unit_insights_to_clusters(unit_insights, similarity_threshold)
+
+    # Persist to database
+    persist_unit_insight_cluster_assignments(session, result)
+
+    return result

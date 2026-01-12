@@ -1,18 +1,21 @@
-# src/innovation_intelligence/analysis/dimensions/assessment_service.py
 """
 Dimension assessment service for insights.
 
 This module provides:
 - Full dimension assessment pipeline (RAG retrieval + LLM assessment)
+- Dispatches to trend or stake assessment based on insight type
 - Batch processing of multiple insights
 - Database persistence of results
 - Integration with the insight extraction pipeline
+
+TRENDS use dimensions: adoption, expectation, progress
+HEALTH STAKES use dimensions: criticality, urgency, actionability
 """
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from sqlalchemy.orm import Session
 
@@ -26,36 +29,48 @@ from innovation_intelligence.db.models import (
     InsightDimension,
     DimensionEvidence,
 )
-from innovation_intelligence.llm.bedrock_client import BedrockClient
-from innovation_intelligence.llm.tools.dimension_tool import (
-    DimensionType,
-    DimensionResult,
-    DimensionEvidence as DimEvidence,
-    assess_dimension,
+from innovation_intelligence.llm.gemini_client import GeminiClient
+from innovation_intelligence.llm.tools.trend_dimension_tool import (
+    TrendDimensionType,
+    TrendDimensionResult,
+    TrendDimensionEvidence,
+    assess_trend_dimension,
+    TREND_DIMENSION_HINTS,
+)
+from innovation_intelligence.llm.tools.stake_dimension_tool import (
+    StakeDimensionType,
+    StakeAssessmentResult,
+    StakeEvidence,
+    assess_health_stake,
+    STAKE_DIMENSION_HINTS,
 )
 from innovation_intelligence.config import settings
 from innovation_intelligence.logger import get_logger
 
 log = get_logger(__name__)
 
+# Type aliases for dimension results (union of both types)
+DimensionResultType = Union[TrendDimensionResult, StakeAssessmentResult]
+
 
 # ---------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------
 @dataclass
-class InsightDimensions:
-    """Complete dimension assessment for an insight."""
+class TrendDimensions:
+    """Dimension assessment for a TREND insight (adoption, expectation, progress)."""
     insight_id: int
     insight_name: str
-    adoption: Optional[DimensionResult] = None
-    expectation: Optional[DimensionResult] = None
-    progress: Optional[DimensionResult] = None
+    adoption: Optional[TrendDimensionResult] = None
+    expectation: Optional[TrendDimensionResult] = None
+    progress: Optional[TrendDimensionResult] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary representation."""
         result = {
             "insight_id": self.insight_id,
             "insight_name": self.insight_name,
+            "insight_type": "trend",
             "dimensions": {},
         }
 
@@ -114,12 +129,93 @@ class InsightDimensions:
 
 
 @dataclass
+class StakeDimensions:
+    """Dimension assessment for a HEALTH STAKE (criticality, urgency, actionability)."""
+    insight_id: int
+    insight_name: str
+    criticality: Optional[StakeAssessmentResult] = None
+    urgency: Optional[StakeAssessmentResult] = None
+    actionability: Optional[StakeAssessmentResult] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary representation."""
+        result = {
+            "insight_id": self.insight_id,
+            "insight_name": self.insight_name,
+            "insight_type": "health_stake",
+            "dimensions": {},
+        }
+
+        if self.criticality:
+            result["dimensions"]["criticality"] = {
+                "level": self.criticality.value,
+                "confidence": self.criticality.confidence,
+                "evidence": [
+                    {
+                        "text": e.text,
+                        "source": e.source,
+                        "speaker": e.speaker,
+                        "page": e.page,
+                        "start": e.start_time,
+                        "end": e.end_time,
+                    }
+                    for e in self.criticality.evidence
+                ],
+            }
+
+        if self.urgency:
+            result["dimensions"]["urgency"] = {
+                "level": self.urgency.value,
+                "confidence": self.urgency.confidence,
+                "evidence": [
+                    {
+                        "text": e.text,
+                        "source": e.source,
+                        "speaker": e.speaker,
+                        "page": e.page,
+                        "start": e.start_time,
+                        "end": e.end_time,
+                    }
+                    for e in self.urgency.evidence
+                ],
+            }
+
+        if self.actionability:
+            result["dimensions"]["actionability"] = {
+                "level": self.actionability.value,
+                "confidence": self.actionability.confidence,
+                "evidence": [
+                    {
+                        "text": e.text,
+                        "source": e.source,
+                        "speaker": e.speaker,
+                        "page": e.page,
+                        "start": e.start_time,
+                        "end": e.end_time,
+                    }
+                    for e in self.actionability.evidence
+                ],
+            }
+
+        return result
+
+
+# Union type for all insight dimensions
+InsightDimensions = Union[TrendDimensions, StakeDimensions]
+
+
+@dataclass
 class AssessmentConfig:
     """Configuration for dimension assessment."""
-    # Which dimensions to assess
+    # Trend dimensions (only used for trends)
     assess_adoption: bool = True
     assess_expectation: bool = True
     assess_progress: bool = True
+
+    # Stake dimensions (only used for health stakes)
+    assess_criticality: bool = True
+    assess_urgency: bool = True
+    assess_actionability: bool = True
 
     # RAG configuration
     rag_config: RAGEngineConfig = field(default_factory=RAGEngineConfig)
@@ -141,9 +237,13 @@ class DimensionAssessmentService:
     """
     Service for assessing dimensions of extracted insights.
 
+    Dispatches to appropriate assessment tool based on insight type:
+    - TRENDS: assessed on adoption, expectation, progress
+    - HEALTH STAKES: assessed on criticality, urgency, actionability
+
     Orchestrates:
     1. RAG retrieval of relevant context
-    2. LLM-based dimension assessment
+    2. LLM-based dimension assessment (trend or stake)
     3. Database persistence of results
     """
 
@@ -151,7 +251,7 @@ class DimensionAssessmentService:
         self,
         session: Session,
         config: Optional[AssessmentConfig] = None,
-        bedrock_client: Optional[BedrockClient] = None,
+        gemini_client: Optional[GeminiClient] = None,
     ):
         """
         Initialize the assessment service.
@@ -159,15 +259,15 @@ class DimensionAssessmentService:
         Args:
             session: SQLAlchemy database session
             config: Optional assessment configuration
-            bedrock_client: Optional pre-configured BedrockClient
+            gemini_client: Optional pre-configured GeminiClient
         """
         self.session = session
         self.config = config or AssessmentConfig()
         self.rag_engine = get_rag_engine(session, self.config.rag_config)
-        self.bedrock_client = bedrock_client or BedrockClient(
-            model_id=settings.aws.bedrock_model_id,
-            region=settings.aws.region,
-            profile=settings.aws.profile,
+        self.gemini_client = gemini_client or GeminiClient(
+            project=settings.gcp.project_id,
+            location=settings.gcp.location,
+            model_id=settings.gcp.gemini_model_id,
         )
 
         # Log RAG stats on init
@@ -180,56 +280,111 @@ class DimensionAssessmentService:
         self,
         insight: UnitInsight,
         *,
-        dimensions: Optional[List[DimensionType]] = None,
         source_filter: Optional[str] = None,
     ) -> InsightDimensions:
         """
         Assess all configured dimensions for a single insight.
 
+        Dispatches to trend or stake assessment based on insight.type.
+
         Args:
             insight: The UnitInsight to assess
-            dimensions: Override which dimensions to assess
             source_filter: Optional filter to specific source
 
         Returns:
-            InsightDimensions with assessment results
+            TrendDimensions or StakeDimensions based on insight type
         """
-        log.info(f"[ASSESS] Processing insight: {insight.name[:60]}...")
+        log.info(f"[ASSESS] Processing insight: {insight.name[:60]}... (type={insight.type})")
 
-        # Determine which dimensions to assess
-        dims_to_assess = dimensions or self._get_dimensions_to_assess(insight)
+        if insight.type == "trend":
+            return self._assess_trend(insight, source_filter)
+        elif insight.type == "health_stake":
+            return self._assess_stake(insight, source_filter)
+        else:
+            log.warning(f"[ASSESS] Unknown insight type '{insight.type}', defaulting to trend assessment")
+            return self._assess_trend(insight, source_filter)
+
+    def _assess_trend(
+        self,
+        insight: UnitInsight,
+        source_filter: Optional[str] = None,
+    ) -> TrendDimensions:
+        """Assess a TREND insight on adoption, expectation, progress."""
+        dims_to_assess = self._get_trend_dimensions_to_assess(insight)
 
         if not dims_to_assess:
-            log.warning(f"[ASSESS] No dimensions to assess for insight {insight.id} (already assessed or config excludes all)")
+            log.warning(f"[ASSESS] No trend dimensions to assess for insight {insight.id}")
 
-        log.info(f"[ASSESS] Will assess {len(dims_to_assess)} dimensions: {[d.value for d in dims_to_assess]}")
+        log.info(f"[ASSESS] Will assess {len(dims_to_assess)} trend dimensions: {[d.value for d in dims_to_assess]}")
 
-        result = InsightDimensions(
+        result = TrendDimensions(
             insight_id=insight.id,
             insight_name=insight.name,
         )
 
         for dim in dims_to_assess:
             try:
-                dim_result = self._assess_single_dimension(
+                dim_result = self._assess_single_trend_dimension(
                     insight=insight,
                     dimension=dim,
                     source_filter=source_filter,
                 )
 
-                if dim == DimensionType.ADOPTION:
+                if dim == TrendDimensionType.ADOPTION:
                     result.adoption = dim_result
-                elif dim == DimensionType.EXPECTATION:
+                elif dim == TrendDimensionType.EXPECTATION:
                     result.expectation = dim_result
-                elif dim == DimensionType.PROGRESS:
+                elif dim == TrendDimensionType.PROGRESS:
                     result.progress = dim_result
 
             except Exception as e:
-                log.error(f"[ASSESS] Failed to assess {dim.value} for {insight.name}: {e}")
+                log.error(f"[ASSESS] Failed to assess trend {dim.value} for {insight.name}: {e}")
 
         # Persist if configured
         if self.config.persist_results:
-            self._persist_dimensions(insight, result)
+            self._persist_trend_dimensions(insight, result)
+
+        return result
+
+    def _assess_stake(
+        self,
+        insight: UnitInsight,
+        source_filter: Optional[str] = None,
+    ) -> StakeDimensions:
+        """Assess a HEALTH STAKE insight on criticality, urgency, actionability."""
+        dims_to_assess = self._get_stake_dimensions_to_assess(insight)
+
+        if not dims_to_assess:
+            log.warning(f"[ASSESS] No stake dimensions to assess for insight {insight.id}")
+
+        log.info(f"[ASSESS] Will assess {len(dims_to_assess)} stake dimensions: {[d.value for d in dims_to_assess]}")
+
+        result = StakeDimensions(
+            insight_id=insight.id,
+            insight_name=insight.name,
+        )
+
+        for dim in dims_to_assess:
+            try:
+                dim_result = self._assess_single_stake_dimension(
+                    insight=insight,
+                    dimension=dim,
+                    source_filter=source_filter,
+                )
+
+                if dim == StakeDimensionType.CRITICALITY:
+                    result.criticality = dim_result
+                elif dim == StakeDimensionType.URGENCY:
+                    result.urgency = dim_result
+                elif dim == StakeDimensionType.ACTIONABILITY:
+                    result.actionability = dim_result
+
+            except Exception as e:
+                log.error(f"[ASSESS] Failed to assess stake {dim.value} for {insight.name}: {e}")
+
+        # Persist if configured
+        if self.config.persist_results:
+            self._persist_stake_dimensions(insight, result)
 
         return result
 
@@ -247,7 +402,7 @@ class DimensionAssessmentService:
             source_filter: Optional filter to specific source
 
         Returns:
-            List of InsightDimensions results
+            List of TrendDimensions or StakeDimensions results
         """
         total = len(insights)
         log.info(f"[ASSESS] Batch processing {total} insights")
@@ -266,11 +421,17 @@ class DimensionAssessmentService:
 
             except Exception as e:
                 log.error(f"[ASSESS] Failed to process insight {insight.id}: {e}")
-                # Add empty result to maintain order
-                results.append(InsightDimensions(
-                    insight_id=insight.id,
-                    insight_name=insight.name,
-                ))
+                # Add empty result to maintain order based on type
+                if insight.type == "health_stake":
+                    results.append(StakeDimensions(
+                        insight_id=insight.id,
+                        insight_name=insight.name,
+                    ))
+                else:
+                    results.append(TrendDimensions(
+                        insight_id=insight.id,
+                        insight_name=insight.name,
+                    ))
 
         log.info(f"[ASSESS] Completed {len(results)}/{total} insights")
         return results
@@ -305,20 +466,12 @@ class DimensionAssessmentService:
 
         return self.assess_insights_batch(insights, source_filter=source_filter)
 
-    def _get_dimensions_to_assess(
+    def _get_trend_dimensions_to_assess(
         self,
         insight: UnitInsight,
-    ) -> List[DimensionType]:
-        """
-        Determine which dimensions need assessment for an insight.
-
-        Args:
-            insight: The insight to check
-
-        Returns:
-            List of dimensions to assess
-        """
-        dims: List[DimensionType] = []
+    ) -> List[TrendDimensionType]:
+        """Determine which TREND dimensions need assessment."""
+        dims: List[TrendDimensionType] = []
 
         # Check existing dimensions if skip_existing is enabled
         existing_types = set()
@@ -326,52 +479,57 @@ class DimensionAssessmentService:
             existing_types = {d.dimension_type for d in insight.dimensions}
             log.debug(f"[ASSESS] Existing dimensions for insight {insight.id}: {existing_types}")
 
-        log.debug(f"[ASSESS] Config: adoption={self.config.assess_adoption}, "
-                  f"expectation={self.config.assess_expectation}, "
-                  f"progress={self.config.assess_progress}, "
-                  f"skip_existing={self.config.skip_existing}")
-
         if self.config.assess_adoption and "adoption" not in existing_types:
-            dims.append(DimensionType.ADOPTION)
+            dims.append(TrendDimensionType.ADOPTION)
 
         if self.config.assess_expectation and "expectation" not in existing_types:
-            dims.append(DimensionType.EXPECTATION)
+            dims.append(TrendDimensionType.EXPECTATION)
 
         if self.config.assess_progress and "progress" not in existing_types:
-            dims.append(DimensionType.PROGRESS)
+            dims.append(TrendDimensionType.PROGRESS)
 
         return dims
 
-    def _assess_single_dimension(
+    def _get_stake_dimensions_to_assess(
         self,
         insight: UnitInsight,
-        dimension: DimensionType,
+    ) -> List[StakeDimensionType]:
+        """Determine which STAKE dimensions need assessment."""
+        dims: List[StakeDimensionType] = []
+
+        # Check existing dimensions if skip_existing is enabled
+        existing_types = set()
+        if self.config.skip_existing and insight.dimensions:
+            existing_types = {d.dimension_type for d in insight.dimensions}
+            log.debug(f"[ASSESS] Existing dimensions for insight {insight.id}: {existing_types}")
+
+        if self.config.assess_criticality and "criticality" not in existing_types:
+            dims.append(StakeDimensionType.CRITICALITY)
+
+        if self.config.assess_urgency and "urgency" not in existing_types:
+            dims.append(StakeDimensionType.URGENCY)
+
+        if self.config.assess_actionability and "actionability" not in existing_types:
+            dims.append(StakeDimensionType.ACTIONABILITY)
+
+        return dims
+
+    def _assess_single_trend_dimension(
+        self,
+        insight: UnitInsight,
+        dimension: TrendDimensionType,
         source_filter: Optional[str] = None,
-    ) -> DimensionResult:
-        """
-        Assess a single dimension for an insight.
-
-        Args:
-            insight: The insight to assess
-            dimension: Which dimension to assess
-            source_filter: Optional source filter
-
-        Returns:
-            DimensionResult with value and evidence
-        """
-        log.info(f"[ASSESS] Retrieving context for {dimension.value}...")
+    ) -> TrendDimensionResult:
+        """Assess a single TREND dimension."""
+        log.info(f"[ASSESS] Retrieving context for trend {dimension.value}...")
 
         # Reuse the precomputed embedding from UnitInsight if available
-        # This avoids redundant embedding computation
-        precomputed_embedding = None
-        if insight.embedding:
-            # UnitInsight.embedding is stored as JSONB (list)
-            precomputed_embedding = insight.embedding
+        precomputed_embedding = insight.embedding if insight.embedding else None
 
-        # Retrieve context via RAG
-        rag_context = self.rag_engine.retrieve_for_insight(
-            insight_name=insight.name,
-            insight_description=insight.description,
+        # Retrieve context via RAG with trend dimension hints
+        rag_context = self.rag_engine.retrieve_for_trend(
+            trend_name=insight.name,
+            trend_description=insight.description,
             dimension=dimension,
             source_filter=source_filter,
             precomputed_embedding=precomputed_embedding,
@@ -383,36 +541,69 @@ class DimensionAssessmentService:
         )
 
         # Assess dimension via LLM
-        result = assess_dimension(
-            insight_name=insight.name,
-            insight_description=insight.description,
+        result = assess_trend_dimension(
+            trend_name=insight.name,
+            trend_description=insight.description,
             dimension=dimension,
             context=rag_context.formatted_text,
             sources=rag_context.sources,
-            client=self.bedrock_client,
+            client=self.gemini_client,
             period=self.config.period,
         )
 
         return result
 
-    def _persist_dimensions(
+    def _assess_single_stake_dimension(
         self,
         insight: UnitInsight,
-        dimensions: InsightDimensions,
-    ) -> None:
-        """
-        Persist dimension results to database.
+        dimension: StakeDimensionType,
+        source_filter: Optional[str] = None,
+    ) -> StakeAssessmentResult:
+        """Assess a single STAKE dimension."""
+        log.info(f"[ASSESS] Retrieving context for stake {dimension.value}...")
 
-        Args:
-            insight: The assessed insight
-            dimensions: Assessment results to persist
-        """
+        # Reuse the precomputed embedding from UnitInsight if available
+        precomputed_embedding = insight.embedding if insight.embedding else None
+
+        # Retrieve context via RAG with stake dimension hints
+        rag_context = self.rag_engine.retrieve_for_stake(
+            stake_name=insight.name,
+            stake_description=insight.description,
+            dimension=dimension,
+            source_filter=source_filter,
+            precomputed_embedding=precomputed_embedding,
+        )
+
+        log.info(
+            f"[ASSESS] Retrieved {len(rag_context.chunks)} chunks "
+            f"({rag_context.total_chars} chars) from {len(rag_context.sources)} sources"
+        )
+
+        # Assess dimension via LLM
+        result = assess_health_stake(
+            stake_name=insight.name,
+            stake_description=insight.description,
+            dimension=dimension,
+            context=rag_context.formatted_text,
+            sources=rag_context.sources,
+            client=self.gemini_client,
+            period=self.config.period,
+        )
+
+        return result
+
+    def _persist_trend_dimensions(
+        self,
+        insight: UnitInsight,
+        dimensions: TrendDimensions,
+    ) -> None:
+        """Persist TREND dimension results to database."""
         persisted = 0
 
         for dim_result, dim_type in [
-            (dimensions.adoption, DimensionType.ADOPTION),
-            (dimensions.expectation, DimensionType.EXPECTATION),
-            (dimensions.progress, DimensionType.PROGRESS),
+            (dimensions.adoption, TrendDimensionType.ADOPTION),
+            (dimensions.expectation, TrendDimensionType.EXPECTATION),
+            (dimensions.progress, TrendDimensionType.PROGRESS),
         ]:
             if dim_result is None:
                 continue
@@ -429,7 +620,6 @@ class DimensionAssessmentService:
 
             # Create evidence records
             for ev in dim_result.evidence:
-                # Build source reference
                 source_parts = [ev.source]
                 if ev.speaker:
                     source_parts.append(ev.speaker)
@@ -438,18 +628,87 @@ class DimensionAssessmentService:
                 if ev.start_time is not None:
                     source_parts.append(f"{ev.start_time:.1f}s")
 
+                # Build metadata dict from evidence
+                chunk_metadata = {}
+                if ev.start_time is not None:
+                    chunk_metadata["start_time"] = ev.start_time
+                if ev.end_time is not None:
+                    chunk_metadata["end_time"] = ev.end_time
+                if ev.page is not None:
+                    chunk_metadata["page"] = ev.page
+
                 db_evidence = DimensionEvidence(
                     dimension_id=db_dim.id,
                     chunk_text=ev.text,
                     similarity_score=ev.similarity_score,
                     source_ref=" | ".join(source_parts),
+                    chunk_metadata=chunk_metadata if chunk_metadata else None,
                 )
                 self.session.add(db_evidence)
 
             persisted += 1
 
         self.session.commit()
-        log.info(f"[ASSESS] Persisted {persisted} dimensions for insight {insight.id}")
+        log.info(f"[ASSESS] Persisted {persisted} trend dimensions for insight {insight.id}")
+
+    def _persist_stake_dimensions(
+        self,
+        insight: UnitInsight,
+        dimensions: StakeDimensions,
+    ) -> None:
+        """Persist STAKE dimension results to database."""
+        persisted = 0
+
+        for dim_result, dim_type in [
+            (dimensions.criticality, StakeDimensionType.CRITICALITY),
+            (dimensions.urgency, StakeDimensionType.URGENCY),
+            (dimensions.actionability, StakeDimensionType.ACTIONABILITY),
+        ]:
+            if dim_result is None:
+                continue
+
+            # Create InsightDimension record
+            db_dim = InsightDimension(
+                unit_insight_id=insight.id,
+                dimension_type=dim_type.value,
+                value=dim_result.value,
+                confidence=dim_result.confidence,
+            )
+            self.session.add(db_dim)
+            self.session.flush()  # Get ID
+
+            # Create evidence records
+            for ev in dim_result.evidence:
+                source_parts = [ev.source]
+                if ev.speaker:
+                    source_parts.append(ev.speaker)
+                if ev.page is not None:
+                    source_parts.append(f"p{ev.page}")
+                if ev.start_time is not None:
+                    source_parts.append(f"{ev.start_time:.1f}s")
+
+                # Build metadata dict from evidence
+                chunk_metadata = {}
+                if ev.start_time is not None:
+                    chunk_metadata["start_time"] = ev.start_time
+                if ev.end_time is not None:
+                    chunk_metadata["end_time"] = ev.end_time
+                if ev.page is not None:
+                    chunk_metadata["page"] = ev.page
+
+                db_evidence = DimensionEvidence(
+                    dimension_id=db_dim.id,
+                    chunk_text=ev.text,
+                    similarity_score=ev.similarity_score,
+                    source_ref=" | ".join(source_parts),
+                    chunk_metadata=chunk_metadata if chunk_metadata else None,
+                )
+                self.session.add(db_evidence)
+
+            persisted += 1
+
+        self.session.commit()
+        log.info(f"[ASSESS] Persisted {persisted} stake dimensions for insight {insight.id}")
 
 
 # ---------------------------------------------------------------------

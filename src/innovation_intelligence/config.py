@@ -43,20 +43,34 @@ class AwsSettings:
 
 
 @dataclass
-class PodcastIndexSettings:
-    api_key: str = os.getenv("PODCAST_API_KEY", "")
-    api_secret: str = os.getenv("PODCAST_API_SECRET", "")
+class GCPSettings:
+    """GCP settings for Google Cloud services (GCS, Speech API, Gemini)."""
+
+    # Project and location
+    project_id: str = os.getenv("VERTEX_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT", "")
+    location: str = os.getenv("GOOGLE_CLOUD_REGION", "us-central1")
+
+    # GCS bucket for audio and transcript storage
+    gcs_bucket: str = os.getenv("GCS_BUCKET", "")
+
+    # Speech API settings (Chirp transcription)
+    speech_region: str = os.getenv("SPEECH_REGION", "us-central1")
+    default_language: str = os.getenv("DEFAULT_LANGUAGE", "en-US")
+
+    # Gemini model ID
+    gemini_model_id: str = os.getenv(
+        "GEMINI_MODEL_ID",
+        "gemini-2.5-pro",
+    )
+
+    # Global analysis period label (e.g. '2025')
+    period_name: str = os.getenv("PERIOD_NAME", "2025")
 
 
 @dataclass
-class TranscriptionSettings:
-    # WhisperX / device config
-    device: str = os.getenv("DEVICE", "cuda")
-    model_size: str = os.getenv("MODEL_SIZE", "large-v2")
-    compute_type: str = os.getenv("COMPUTE_TYPE", "float16")  # or "int8"
-
-    # Hugging Face token for diarization
-    hf_token: str = os.getenv("HF_TOKEN", "")
+class PodcastIndexSettings:
+    api_key: str = os.getenv("PODCAST_API_KEY", "")
+    api_secret: str = os.getenv("PODCAST_API_SECRET", "")
 
 
 @dataclass
@@ -145,12 +159,18 @@ class PathSettings:
 class AppSettings:
     db: DatabaseSettings = field(default_factory=DatabaseSettings)
     aws: AwsSettings = field(default_factory=AwsSettings)
+    gcp: GCPSettings = field(default_factory=GCPSettings)
     podcast_index: PodcastIndexSettings = field(default_factory=PodcastIndexSettings)
-    transcription: TranscriptionSettings = field(default_factory=TranscriptionSettings)
     paths: PathSettings = field(default_factory=PathSettings)
     embeddings: EmbeddingsSettings = field(default_factory=EmbeddingsSettings)
 
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
+
+    # Backward compatibility alias
+    @property
+    def vertex_ai(self) -> GCPSettings:
+        """Backward compatibility alias for vertex_ai -> gcp."""
+        return self.gcp
 
 
 # Global settings instance

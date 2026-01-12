@@ -1,16 +1,14 @@
 """
-End-to-end vector indexing pipeline.
+End-to-end vector indexing pipeline (GCS-first mode).
 
 Orchestrates:
-1. Speaker identification for podcasts
-2. Transcript transformation
-3. Chunking (podcasts and documents)
-4. Embedding
-5. Storage in pgvector
+1. Transcript loading from GCS
+2. Chunking (podcasts and documents)
+3. Embedding
+4. Storage in pgvector
 
-Supports both:
-- Batch processing (folder discovery)
-- Single document upload (API-ready)
+All content is loaded from GCS URIs stored in the database.
+No local file discovery - all sources must be ingested first.
 """
 from __future__ import annotations
 
@@ -23,11 +21,6 @@ from typing import Any, BinaryIO, Dict, List, Optional, Union
 from innovation_intelligence.config import settings
 from innovation_intelligence.logger import get_logger
 
-# Speaker identification
-from innovation_intelligence.llm.tools.speaker_identification_tool import (
-    identify_speakers_from_file,
-)
-
 # Transcript transformation
 from innovation_intelligence.ingestion.podcasts.transcript_transformer import (
     transform_transcript,
@@ -35,11 +28,11 @@ from innovation_intelligence.ingestion.podcasts.transcript_transformer import (
 )
 
 # Chunking
-from innovation_intelligence.chunking.podcast_chunker import (
+from innovation_intelligence.ingestion.podcasts.podcast_chunker import (
     PodcastChunker,
     PodcastChunk,
 )
-from innovation_intelligence.chunking.document_chunker import (
+from innovation_intelligence.ingestion.documents.document_chunker import (
     DocumentChunker,
     DocumentChunk,
 )
@@ -98,11 +91,9 @@ class VectorIndexingPipeline:
 
     def __init__(
         self,
-        run_speaker_identification: bool = True,
         batch_size: int = 50,
         session=None,
     ):
-        self.run_speaker_identification = run_speaker_identification
         self.batch_size = batch_size
 
         # Session management
@@ -132,53 +123,37 @@ class VectorIndexingPipeline:
     # -----------------------------------------------------------------
     # Podcast indexing
     # -----------------------------------------------------------------
-    def index_podcast_episode(
+    def index_podcast_episode_from_gcs(
         self,
-        transcript_path: Path,
-        episode_title: Optional[str] = None,
+        gcs_transcript_uri: str,
+        podcast_name: str,
+        episode_title: str,
         episode_date: Optional[str] = None,
-        speaker_map: Optional[Dict[str, str]] = None,
     ) -> int:
         """
-        Index a single podcast episode.
+        Index a single podcast episode from GCS (GCS-first mode).
 
         Args:
-            transcript_path: Path to transcript JSON
-            episode_title: Episode title (uses filename if not provided)
-            episode_date: Episode publication date
-            speaker_map: Pre-computed speaker mapping (skips identification)
+            gcs_transcript_uri: GCS URI to transcript JSON
+            podcast_name: Podcast name
+            episode_title: Episode title
+            episode_date: Episode publication date (optional)
 
         Returns:
             Number of chunks indexed
         """
-        transcript_path = Path(transcript_path)
-        source = transcript_path.stem
-        episode_title = episode_title or source
+        from innovation_intelligence.ingestion.gcs_service import GCSStorageService
+        from innovation_intelligence.ingestion.podcasts.podcast_chunker import chunk_from_gcs
 
-        log.info(f"[INDEX] Processing podcast: {episode_title}")
+        source = f"{podcast_name} - {episode_title}"
+        log.info(f"[INDEX] Processing podcast from GCS: {source}")
 
         try:
-            # Step 1: Transform transcript (with speaker identification)
-            transformed = transform_transcript(
-                transcript_path,
-                episode_title,
-                speaker_map=speaker_map,
-                run_identification=self.run_speaker_identification and speaker_map is None,
-            )
-
-            if not transformed.segments:
-                log.warning(f"[INDEX] No segments in {source}")
-                return 0
-
-            # Step 2: Chunk the transcript
-            chunks = self.podcast_chunker.chunk(
-                segments=transformed.segments,
+            # Step 1: Load and chunk transcript from GCS
+            chunks = chunk_from_gcs(
+                gcs_transcript_uri=gcs_transcript_uri,
                 source=source,
                 episode_date=episode_date,
-                metadata={
-                    "episode_title": episode_title,
-                    "speaker_map": transformed.speaker_map,
-                },
             )
 
             if not chunks:
@@ -187,12 +162,12 @@ class VectorIndexingPipeline:
 
             self.stats.podcast_chunks_created += len(chunks)
 
-            # Step 3: Embed chunks
+            # Step 2: Embed chunks
             log.info(f"[INDEX] Embedding {len(chunks)} podcast chunks")
             texts_to_embed = [chunk.full_text for chunk in chunks]
             embeddings = embed_texts_batch(texts_to_embed)
 
-            # Step 4: Store in database
+            # Step 3: Store in database
             repo = VectorRepository(self.session)
 
             # Delete existing chunks for this source (re-indexing)
@@ -211,30 +186,32 @@ class VectorIndexingPipeline:
             self.stats.errors.append(error_msg)
             return 0
 
-    def index_podcast_directory(
-        self,
-        transcripts_dir: Path,
-        pattern: str = "*.json",
-    ) -> int:
+    def index_all_podcasts_from_db(self) -> int:
         """
-        Index all podcasts in a directory.
+        Index all podcast episodes from database (GCS-first mode).
 
-        Args:
-            transcripts_dir: Directory containing transcript JSONs
-            pattern: Glob pattern for files
+        Queries all episodes with GCS transcript URIs and indexes them.
 
         Returns:
             Total chunks indexed
         """
-        transcripts_dir = Path(transcripts_dir)
-        transcript_files = sorted(transcripts_dir.glob(pattern))
+        from innovation_intelligence.db.models import PodcastEpisode
 
-        log.info(f"[INDEX] Found {len(transcript_files)} podcast transcripts in {transcripts_dir}")
+        episodes = self.session.query(PodcastEpisode).filter(
+            PodcastEpisode.gcs_transcript_uri.isnot(None)
+        ).all()
+
+        log.info(f"[INDEX] Found {len(episodes)} podcast episodes with GCS transcripts in database")
 
         total_chunks = 0
-        for i, file_path in enumerate(transcript_files, 1):
-            log.info(f"[INDEX] Processing podcast {i}/{len(transcript_files)}: {file_path.name}")
-            chunks = self.index_podcast_episode(file_path)
+        for i, episode in enumerate(episodes, 1):
+            log.info(f"[INDEX] Processing podcast {i}/{len(episodes)}: {episode.podcast_name} - {episode.episode_title}")
+            chunks = self.index_podcast_episode_from_gcs(
+                gcs_transcript_uri=episode.gcs_transcript_uri,
+                podcast_name=episode.podcast_name,
+                episode_title=episode.episode_title,
+                episode_date=episode.episode_date.isoformat() if episode.episode_date else None,
+            )
             total_chunks += chunks
 
         return total_chunks
@@ -242,43 +219,55 @@ class VectorIndexingPipeline:
     # -----------------------------------------------------------------
     # Document indexing
     # -----------------------------------------------------------------
-    def index_document(
+    def index_document_from_gcs(
         self,
-        document_path: Path,
-        source: Optional[str] = None,
+        gcs_transcript_uri: str,
+        source: str,
         document_date: Optional[str] = None,
     ) -> int:
         """
-        Index a single document.
+        Index a single document from GCS (GCS-first mode).
 
         Args:
-            document_path: Path to document (txt file)
-            source: Document identifier
-            document_date: Document date
+            gcs_transcript_uri: GCS URI to transcript text file
+            source: Document title
+            document_date: Document date (optional)
 
         Returns:
             Number of chunks indexed
         """
-        document_path = Path(document_path)
-        source = source or document_path.stem
+        from innovation_intelligence.ingestion.gcs_service import GCSStorageService
 
-        log.info(f"[INDEX] Processing document: {source}")
+        log.info(f"[INDEX] Processing document from GCS: {source}")
 
         try:
-            # Step 1: Read document
-            with open(document_path, "r", encoding="utf-8") as f:
-                text = f.read()
+            # Step 1: Load transcript from GCS
+            gcs_service = GCSStorageService()
+            data = gcs_service.read_json(gcs_transcript_uri)
+
+            # Extract text and segments from the transcript data
+            text = data.get("text", "")
+            segments = data.get("segments", [])
 
             if not text.strip():
                 log.warning(f"[INDEX] Empty document: {source}")
                 return 0
 
-            # Step 2: Chunk the document
-            chunks = self.document_chunker.chunk(
-                text=text,
-                source=source,
-                document_date=document_date,
-            )
+            # Step 2: Chunk the document (use segments if available for accurate page numbers)
+            if segments:
+                log.debug(f"[INDEX] Using segments for accurate page tracking ({len(segments)} pages)")
+                chunks = self.document_chunker.chunk_from_segments(
+                    segments=segments,
+                    source=source,
+                    document_date=document_date,
+                )
+            else:
+                log.debug(f"[INDEX] Using legacy text-based chunking (no page info)")
+                chunks = self.document_chunker.chunk(
+                    text=text,
+                    source=source,
+                    document_date=document_date,
+                )
 
             if not chunks:
                 log.warning(f"[INDEX] No chunks created for {source}")
@@ -310,30 +299,31 @@ class VectorIndexingPipeline:
             self.stats.errors.append(error_msg)
             return 0
 
-    def index_document_directory(
-        self,
-        documents_dir: Path,
-        pattern: str = "*.txt",
-    ) -> int:
+    def index_all_documents_from_db(self) -> int:
         """
-        Index all documents in a directory.
+        Index all documents from database (GCS-first mode).
 
-        Args:
-            documents_dir: Directory containing document files
-            pattern: Glob pattern for files
+        Queries all documents with GCS transcript URIs and indexes them.
 
         Returns:
             Total chunks indexed
         """
-        documents_dir = Path(documents_dir)
-        document_files = sorted(documents_dir.glob(pattern))
+        from innovation_intelligence.db.models import Document
 
-        log.info(f"[INDEX] Found {len(document_files)} documents in {documents_dir}")
+        documents = self.session.query(Document).filter(
+            Document.gcs_transcript_uri.isnot(None)
+        ).all()
+
+        log.info(f"[INDEX] Found {len(documents)} documents with GCS transcripts in database")
 
         total_chunks = 0
-        for i, file_path in enumerate(document_files, 1):
-            log.info(f"[INDEX] Processing document {i}/{len(document_files)}: {file_path.name}")
-            chunks = self.index_document(file_path)
+        for i, doc in enumerate(documents, 1):
+            log.info(f"[INDEX] Processing document {i}/{len(documents)}: {doc.title}")
+            chunks = self.index_document_from_gcs(
+                gcs_transcript_uri=doc.gcs_transcript_uri,
+                source=doc.title,
+                document_date=doc.document_date.isoformat() if doc.document_date else None,
+            )
             total_chunks += chunks
 
         return total_chunks
@@ -404,51 +394,60 @@ class VectorIndexingPipeline:
                 error=upload_result.error,
             )
 
-        # Step 2: Index the extracted text
-        if not upload_result.transcript_path:
+        # Step 2: Index the extracted text from GCS
+        if not upload_result.gcs_transcript_uri:
             return DocumentIngestionResult(
                 success=False,
                 document_id=upload_result.document_id,
                 title=title,
-                error="No transcript path - text extraction may have failed",
+                error="No GCS transcript URI - text extraction may have failed",
             )
 
-        transcript_path = Path(upload_result.transcript_path)
-        if not transcript_path.exists():
+        # Download transcript from GCS to temp file for indexing
+        from innovation_intelligence.ingestion.gcs_service import GCSStorageService
+        import tempfile
+
+        gcs_service = GCSStorageService()
+        tmp_transcript = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
+        tmp_transcript_path = Path(tmp_transcript.name)
+
+        try:
+            # Read transcript from GCS
+            transcript_data = gcs_service.read_text(upload_result.gcs_transcript_uri)
+            tmp_transcript.write(transcript_data)
+            tmp_transcript.close()
+
+            # Index using the standard method
+            chunks_indexed = self.index_document(
+                document_path=tmp_transcript_path,
+                source=title,
+                document_date=document_date.isoformat() if document_date else None,
+            )
+
+            log.info(f"[INGEST] Completed: {title} ({chunks_indexed} chunks)")
+
             return DocumentIngestionResult(
-                success=False,
+                success=True,
                 document_id=upload_result.document_id,
                 title=title,
-                error=f"Transcript file not found: {transcript_path}",
+                gcs_uri=upload_result.gcs_uri,
+                gcs_transcript_uri=upload_result.gcs_transcript_uri,
+                chunks_indexed=chunks_indexed,
             )
-
-        # Index using the standard method
-        chunks_indexed = self.index_document(
-            document_path=transcript_path,
-            source=transcript_path.stem,
-            document_date=document_date.isoformat() if document_date else None,
-        )
-
-        log.info(f"[INGEST] Completed: {title} ({chunks_indexed} chunks)")
-
-        return DocumentIngestionResult(
-            success=True,
-            document_id=upload_result.document_id,
-            title=title,
-            file_path=upload_result.file_path,
-            transcript_path=upload_result.transcript_path,
-            chunks_indexed=chunks_indexed,
-        )
+        finally:
+            # Clean up temp file
+            if tmp_transcript_path.exists():
+                tmp_transcript_path.unlink()
 
 
 @dataclass
 class DocumentIngestionResult:
-    """Result of a document ingestion (upload + indexing)."""
+    """Result of a document ingestion (upload + indexing) - GCS-first mode."""
     success: bool
     document_id: Optional[int] = None
     title: str = ""
-    file_path: Optional[str] = None
-    transcript_path: Optional[str] = None
+    gcs_uri: Optional[str] = None
+    gcs_transcript_uri: Optional[str] = None
     chunks_indexed: int = 0
     error: Optional[str] = None
 
@@ -457,8 +456,8 @@ class DocumentIngestionResult:
             "success": self.success,
             "document_id": self.document_id,
             "title": self.title,
-            "file_path": self.file_path,
-            "transcript_path": self.transcript_path,
+            "gcs_uri": self.gcs_uri,
+            "gcs_transcript_uri": self.gcs_transcript_uri,
             "chunks_indexed": self.chunks_indexed,
             "error": self.error,
         }
@@ -512,70 +511,44 @@ def ingest_document(
         )
 
 
-def index_podcasts(
-    transcripts_dir: Optional[Path] = None,
-    run_speaker_identification: bool = True,
-) -> IndexingStats:
+def index_podcasts() -> IndexingStats:
     """
-    Index all podcasts from the default or specified directory.
-
-    Args:
-        transcripts_dir: Directory with transcript JSONs (defaults to config)
-        run_speaker_identification: Whether to identify speakers
+    Index all podcasts from database (GCS-first mode).
 
     Returns:
         IndexingStats with results
     """
-    transcripts_dir = transcripts_dir or settings.paths.transcripts_dir
-
-    with VectorIndexingPipeline(run_speaker_identification=run_speaker_identification) as pipeline:
-        pipeline.index_podcast_directory(transcripts_dir)
+    with VectorIndexingPipeline() as pipeline:
+        pipeline.index_all_podcasts_from_db()
         return pipeline.stats
 
 
-def index_documents(
-    documents_dir: Optional[Path] = None,
-) -> IndexingStats:
+def index_documents() -> IndexingStats:
     """
-    Index all documents from the default or specified directory.
-
-    Args:
-        documents_dir: Directory with document files
+    Index all documents from database (GCS-first mode).
 
     Returns:
         IndexingStats with results
     """
-    # Default to documents/transcripts (extracted text)
-    documents_dir = documents_dir or (settings.paths.data_root / "documents" / "transcripts")
-
     with VectorIndexingPipeline() as pipeline:
-        pipeline.index_document_directory(documents_dir)
+        pipeline.index_all_documents_from_db()
         return pipeline.stats
 
 
 def run_full_ingestion(
-    podcasts_dir: Optional[Path] = None,
-    documents_dir: Optional[Path] = None,
-    run_speaker_identification: bool = True,
     run_migration_first: bool = True,
 ) -> IndexingStats:
     """
-    Run full ingestion: podcasts + documents.
+    Run full ingestion: podcasts + documents from database (GCS-first mode).
 
     Args:
-        podcasts_dir: Directory with podcast transcripts
-        documents_dir: Directory with document files
-        run_speaker_identification: Whether to identify speakers
         run_migration_first: Whether to run DB migration first
 
     Returns:
         Combined IndexingStats
     """
-    podcasts_dir = podcasts_dir or settings.paths.transcripts_dir
-    documents_dir = documents_dir or (settings.paths.data_root / "documents" / "transcripts")
-
     log.info("="*60)
-    log.info("[INGESTION] Starting full vector ingestion")
+    log.info("[INGESTION] Starting full vector ingestion (GCS-first mode)")
     log.info("="*60)
 
     # Run migration if requested
@@ -583,14 +556,14 @@ def run_full_ingestion(
         log.info("[INGESTION] Running database migration...")
         run_migration()
 
-    with VectorIndexingPipeline(run_speaker_identification=run_speaker_identification) as pipeline:
-        # Index podcasts
-        log.info("[INGESTION] Indexing podcasts...")
-        pipeline.index_podcast_directory(podcasts_dir)
+    with VectorIndexingPipeline() as pipeline:
+        # Index podcasts from database
+        log.info("[INGESTION] Indexing podcasts from database...")
+        pipeline.index_all_podcasts_from_db()
 
-        # Index documents
-        log.info("[INGESTION] Indexing documents...")
-        pipeline.index_document_directory(documents_dir)
+        # Index documents from database
+        log.info("[INGESTION] Indexing documents from database...")
+        pipeline.index_all_documents_from_db()
 
         log.info("="*60)
         log.info("[INGESTION] Ingestion complete")
@@ -598,6 +571,36 @@ def run_full_ingestion(
         log.info("="*60)
 
         return pipeline.stats
+
+
+def run_indexing_pipeline(
+    session,
+    podcasts_only: bool = False,
+    documents_only: bool = False,
+) -> dict:
+    """
+    Run vector indexing pipeline from database (GCS-first mode, for API use).
+
+    Args:
+        session: Database session
+        podcasts_only: Index only podcasts
+        documents_only: Index only documents
+
+    Returns:
+        Dict with podcast_chunks and document_chunks counts
+    """
+    pipeline = VectorIndexingPipeline(session=session)
+
+    if not documents_only:
+        pipeline.index_all_podcasts_from_db()
+
+    if not podcasts_only:
+        pipeline.index_all_documents_from_db()
+
+    return {
+        "podcast_chunks": pipeline.stats.podcast_chunks_stored,
+        "document_chunks": pipeline.stats.document_chunks_stored,
+    }
 
 
 # -----------------------------------------------------------------
@@ -611,47 +614,30 @@ if __name__ == "__main__":
 
     if "--help" in args or "-h" in args:
         print("""
-Vector Indexing Pipeline
+Vector Indexing Pipeline (GCS-first mode)
 
 Usage:
-    python pipeline.py                    # Run full ingestion
-    python pipeline.py --podcasts-only    # Index only podcasts
-    python pipeline.py --documents-only   # Index only documents
-    python pipeline.py --no-speaker-id    # Skip speaker identification
+    python pipeline.py                    # Run full ingestion from database
+    python pipeline.py --podcasts-only    # Index only podcasts from database
+    python pipeline.py --documents-only   # Index only documents from database
     python pipeline.py --skip-migration   # Skip DB migration
 
-Options:
-    --podcasts-dir <path>   Custom podcasts directory
-    --documents-dir <path>  Custom documents directory
+All content is loaded from GCS URIs stored in the database.
 """)
         sys.exit(0)
 
     # Parse options
-    run_speaker_id = "--no-speaker-id" not in args
     run_migration_flag = "--skip-migration" not in args
     podcasts_only = "--podcasts-only" in args
     documents_only = "--documents-only" in args
 
-    # Custom directories
-    podcasts_dir = None
-    documents_dir = None
-
-    for i, arg in enumerate(args):
-        if arg == "--podcasts-dir" and i + 1 < len(args):
-            podcasts_dir = Path(args[i + 1])
-        elif arg == "--documents-dir" and i + 1 < len(args):
-            documents_dir = Path(args[i + 1])
-
     # Run appropriate indexing
     if podcasts_only:
-        stats = index_podcasts(podcasts_dir, run_speaker_id)
+        stats = index_podcasts()
     elif documents_only:
-        stats = index_documents(documents_dir)
+        stats = index_documents()
     else:
         stats = run_full_ingestion(
-            podcasts_dir=podcasts_dir,
-            documents_dir=documents_dir,
-            run_speaker_identification=run_speaker_id,
             run_migration_first=run_migration_flag,
         )
 

@@ -22,6 +22,54 @@ router = APIRouter(prefix="/analysis", tags=["analysis"])
 _analysis_tasks: dict[str, dict] = {}
 
 
+def _determine_episode_status(episode, session):
+    """
+    Determine the current processing status of an episode.
+
+    Returns one of: "analyzed", "ready", "indexing", "transcribing", "needs_processing"
+
+    Note: An episode is only "analyzed" if its insights have dimension assessments.
+    """
+    from innovation_intelligence.db.models import UnitInsight, PodcastChunkVector, InsightDimension
+
+    # Check if episode has insights with dimension assessments (fully analyzed)
+    insights = session.query(UnitInsight).filter(
+        UnitInsight.episode_id == episode.id
+    ).all()
+
+    if insights:
+        # Check if at least one insight has dimension assessments
+        has_dimensions = False
+        for insight in insights:
+            dimension_count = session.query(InsightDimension).filter(
+                InsightDimension.unit_insight_id == insight.id
+            ).count()
+            if dimension_count > 0:
+                has_dimensions = True
+                break
+
+        if has_dimensions:
+            return "analyzed"
+        # Has insights but no dimensions yet - still being analyzed
+        # This shouldn't happen in normal flow, but return "ready" as fallback
+
+    if episode.gcs_transcript_uri:
+        # Has transcript - check if indexed
+        source = f"{episode.podcast_name} - {episode.episode_title}"
+        has_chunks = session.query(PodcastChunkVector).filter(
+            PodcastChunkVector.source == source
+        ).first() is not None
+
+        if has_chunks:
+            return "ready"
+        else:
+            return "indexing"
+    elif episode.gcs_audio_uri:
+        return "transcribing"
+    else:
+        return "needs_processing"
+
+
 def _run_analysis_pipeline(task_id: str, config: dict):
     """Background task for running the analysis pipeline."""
     from innovation_intelligence.db.session import SessionLocal
@@ -31,10 +79,28 @@ def _run_analysis_pipeline(task_id: str, config: dict):
         run_clustering_only,
         AnalysisPipelineConfig,
     )
+    from innovation_intelligence.api.sse_broadcaster import broadcast_analysis_status, broadcast_episode_status
+    from innovation_intelligence.db.models import PodcastEpisode, Document
 
     session = SessionLocal()
     try:
         _analysis_tasks[task_id]["status"] = TaskStatus.RUNNING
+
+        # Broadcast that analysis has started
+        broadcast_analysis_status(task_id, TaskStatus.RUNNING)
+
+        # Broadcast "analyzing" status ONLY for episodes that are in "ready" state
+        # (have indexed transcripts but no insights yet)
+        from innovation_intelligence.db.models import PodcastChunkVector, UnitInsight
+        episodes = session.query(PodcastEpisode).filter(
+            PodcastEpisode.gcs_transcript_uri.isnot(None)
+        ).all()
+
+        for episode in episodes:
+            # Only mark as "analyzing" if the episode is in "ready" state
+            current_status = _determine_episode_status(episode, session)
+            if current_status == "ready":
+                broadcast_episode_status(episode.id, "analyzing")
 
         # Build pipeline config
         pipeline_config = AnalysisPipelineConfig(
@@ -43,8 +109,8 @@ def _run_analysis_pipeline(task_id: str, config: dict):
             run_macro_discovery=config.get("run_macro_discovery", True),
             run_strategic_clustering=config.get("run_strategic_clustering", True),
             force_reextract=config.get("force_reextract", False),
-            macro_similarity_threshold=config.get("macro_similarity_threshold", 0.72),
-            cluster_similarity_threshold=config.get("cluster_similarity_threshold", 0.75),
+            macro_similarity_threshold=config.get("macro_similarity_threshold", 0.7),
+            cluster_similarity_threshold=config.get("cluster_similarity_threshold", 0.5),
             use_llm_naming=config.get("use_llm_naming", True),
             generate_macro_descriptions=config.get("generate_macro_descriptions", False),
             continue_on_error=config.get("continue_on_error", True),
@@ -85,10 +151,41 @@ def _run_analysis_pipeline(task_id: str, config: dict):
         }
         log.info("[ANALYSIS] Pipeline completed: success=%s", result.success)
 
+        # CRITICAL: Commit the transaction before broadcasting status
+        # This ensures all insights and dimensions are visible in other sessions
+        session.commit()
+        log.info("[ANALYSIS] Transaction committed")
+
+        # Broadcast completion and update episode statuses
+        broadcast_analysis_status(
+            task_id,
+            TaskStatus.COMPLETED if result.success else TaskStatus.FAILED,
+            result=_analysis_tasks[task_id]["result"]
+        )
+
+        # Broadcast final status for ALL episodes based on their actual state
+        all_episodes = session.query(PodcastEpisode).all()
+        for episode in all_episodes:
+            status = _determine_episode_status(episode, session)
+            broadcast_episode_status(episode.id, status)
+
     except Exception as e:
         log.exception("[ANALYSIS] Pipeline failed: %s", e)
         _analysis_tasks[task_id]["status"] = TaskStatus.FAILED
         _analysis_tasks[task_id]["error"] = str(e)
+
+        # Rollback any uncommitted changes
+        session.rollback()
+        log.info("[ANALYSIS] Transaction rolled back due to error")
+
+        # Broadcast failure
+        broadcast_analysis_status(task_id, TaskStatus.FAILED, error=str(e))
+
+        # Restore episode statuses to their correct state after failure
+        all_episodes = session.query(PodcastEpisode).all()
+        for episode in all_episodes:
+            status = _determine_episode_status(episode, session)
+            broadcast_episode_status(episode.id, status)
     finally:
         session.close()
 
@@ -237,4 +334,4 @@ def reset_analysis_data(
     db.commit()
 
     deleted_items = ", ".join(f"{k}: {v}" for k, v in counts.items() if v > 0)
-    return SuccessResponse(message=f"Reset complete. Deleted: {deleted_items or 'nothing'}"
+    return SuccessResponse(message=f"Reset complete. Deleted: {deleted_items or 'nothing'}")

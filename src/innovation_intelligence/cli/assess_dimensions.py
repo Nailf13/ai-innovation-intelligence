@@ -3,6 +3,10 @@
 """
 CLI entrypoint for dimension assessment.
 
+Supports two types of insights with different dimensions:
+- TRENDS: adoption, expectation, progress
+- HEALTH STAKES: criticality, urgency, actionability
+
 Usage:
     python -m innovation_intelligence.cli.assess_dimensions --help
     python -m innovation_intelligence.cli.assess_dimensions run              # Assess all insights without dimensions
@@ -14,7 +18,7 @@ Usage:
 import argparse
 import json
 import sys
-from typing import Optional
+from typing import Optional, Union
 
 from innovation_intelligence.config import settings
 from innovation_intelligence.logger import get_logger
@@ -28,6 +32,8 @@ def cmd_run(args):
         DimensionAssessmentService,
         AssessmentConfig,
         RAGEngineConfig,
+        TrendDimensions,
+        StakeDimensions,
     )
     from innovation_intelligence.db.models import UnitInsight
     from innovation_intelligence.db.session import SessionLocal
@@ -44,9 +50,15 @@ def cmd_run(args):
         )
 
         config = AssessmentConfig(
+            # Trend dimensions
             assess_adoption=not args.skip_adoption,
             assess_expectation=not args.skip_expectation,
             assess_progress=not args.skip_progress,
+            # Stake dimensions
+            assess_criticality=not args.skip_criticality,
+            assess_urgency=not args.skip_urgency,
+            assess_actionability=not args.skip_actionability,
+            # General config
             rag_config=rag_config,
             persist_results=not args.dry_run,
             skip_existing=not args.force,
@@ -62,7 +74,7 @@ def cmd_run(args):
                 print(f"Insight with ID {args.insight_id} not found.")
                 sys.exit(1)
 
-            print(f"Assessing dimensions for: {insight.name[:60]}...")
+            print(f"Assessing dimensions for: {insight.name[:60]}... (type={insight.type})")
             result = service.assess_insight(insight)
             _print_result(result)
 
@@ -79,34 +91,65 @@ def cmd_run(args):
                     print("-" * 60)
 
             # Summary
-            total_dims = sum(
-                (1 if r.adoption else 0) + (1 if r.expectation else 0) + (1 if r.progress else 0)
-                for r in results
-            )
+            total_dims = _count_dimensions(results)
             print(f"\nTotal dimensions assessed: {total_dims}")
 
     finally:
         session.close()
 
 
+def _count_dimensions(results) -> int:
+    """Count total dimensions assessed across all results."""
+    from innovation_intelligence.analysis.dimensions import TrendDimensions, StakeDimensions
+
+    count = 0
+    for r in results:
+        if isinstance(r, TrendDimensions):
+            count += (1 if r.adoption else 0) + (1 if r.expectation else 0) + (1 if r.progress else 0)
+        elif isinstance(r, StakeDimensions):
+            count += (1 if r.criticality else 0) + (1 if r.urgency else 0) + (1 if r.actionability else 0)
+    return count
+
+
 def _print_result(result):
-    """Print a single assessment result."""
+    """Print a single assessment result (trend or stake)."""
+    from innovation_intelligence.analysis.dimensions import TrendDimensions, StakeDimensions
+
     print(f"\n  {result.insight_name[:60]}")
 
-    if result.adoption:
-        print(f"    Adoption:    {result.adoption.value}")
-        if result.adoption.confidence:
-            print(f"                 (confidence: {result.adoption.confidence:.2f})")
+    if isinstance(result, TrendDimensions):
+        print("    Type: TREND")
+        if result.adoption:
+            print(f"    Adoption:    {result.adoption.value}")
+            if result.adoption.confidence:
+                print(f"                 (confidence: {result.adoption.confidence:.2f})")
 
-    if result.expectation:
-        print(f"    Expectation: {result.expectation.value}")
-        if result.expectation.confidence:
-            print(f"                 (confidence: {result.expectation.confidence:.2f})")
+        if result.expectation:
+            print(f"    Expectation: {result.expectation.value}")
+            if result.expectation.confidence:
+                print(f"                 (confidence: {result.expectation.confidence:.2f})")
 
-    if result.progress:
-        print(f"    Progress:    {result.progress.value}")
-        if result.progress.confidence:
-            print(f"                 (confidence: {result.progress.confidence:.2f})")
+        if result.progress:
+            print(f"    Progress:    {result.progress.value}")
+            if result.progress.confidence:
+                print(f"                 (confidence: {result.progress.confidence:.2f})")
+
+    elif isinstance(result, StakeDimensions):
+        print("    Type: HEALTH STAKE")
+        if result.criticality:
+            print(f"    Criticality:   {result.criticality.value}")
+            if result.criticality.confidence:
+                print(f"                   (confidence: {result.criticality.confidence:.2f})")
+
+        if result.urgency:
+            print(f"    Urgency:       {result.urgency.value}")
+            if result.urgency.confidence:
+                print(f"                   (confidence: {result.urgency.confidence:.2f})")
+
+        if result.actionability:
+            print(f"    Actionability: {result.actionability.value}")
+            if result.actionability.confidence:
+                print(f"                   (confidence: {result.actionability.confidence:.2f})")
 
 
 def cmd_stats(args):
@@ -202,6 +245,7 @@ def cmd_export(args):
                     for ev in dim.evidence_chunks
                 ]
 
+                # Trend dimensions
                 if dim.dimension_type == "adoption":
                     insight_data["dimensions"]["adoption"] = {
                         "stage": dim.value,
@@ -217,6 +261,25 @@ def cmd_export(args):
                 elif dim.dimension_type == "progress":
                     insight_data["dimensions"]["progress"] = {
                         "horizon": dim.value,
+                        "confidence": dim.confidence,
+                        "evidence": evidence_list,
+                    }
+                # Stake dimensions
+                elif dim.dimension_type == "criticality":
+                    insight_data["dimensions"]["criticality"] = {
+                        "level": dim.value,
+                        "confidence": dim.confidence,
+                        "evidence": evidence_list,
+                    }
+                elif dim.dimension_type == "urgency":
+                    insight_data["dimensions"]["urgency"] = {
+                        "level": dim.value,
+                        "confidence": dim.confidence,
+                        "evidence": evidence_list,
+                    }
+                elif dim.dimension_type == "actionability":
+                    insight_data["dimensions"]["actionability"] = {
+                        "level": dim.value,
                         "confidence": dim.confidence,
                         "evidence": evidence_list,
                     }
@@ -305,26 +368,43 @@ Examples:
         action="store_true",
         help="Don't persist results to database",
     )
+    # Trend dimensions
     run_parser.add_argument(
         "--skip-adoption",
         action="store_true",
-        help="Skip adoption dimension",
+        help="Skip adoption dimension (trends only)",
     )
     run_parser.add_argument(
         "--skip-expectation",
         action="store_true",
-        help="Skip expectation dimension",
+        help="Skip expectation dimension (trends only)",
     )
     run_parser.add_argument(
         "--skip-progress",
         action="store_true",
-        help="Skip progress dimension",
+        help="Skip progress dimension (trends only)",
+    )
+    # Stake dimensions
+    run_parser.add_argument(
+        "--skip-criticality",
+        action="store_true",
+        help="Skip criticality dimension (health stakes only)",
+    )
+    run_parser.add_argument(
+        "--skip-urgency",
+        action="store_true",
+        help="Skip urgency dimension (health stakes only)",
+    )
+    run_parser.add_argument(
+        "--skip-actionability",
+        action="store_true",
+        help="Skip actionability dimension (health stakes only)",
     )
     run_parser.add_argument(
         "--top-k",
         type=int,
-        default=10,
-        help="Number of chunks to retrieve (default: 10)",
+        default=3,
+        help="Number of chunks to retrieve (default: 3)",
     )
     run_parser.add_argument(
         "--min-similarity",

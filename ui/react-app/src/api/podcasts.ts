@@ -1,5 +1,5 @@
 import apiClient from './client';
-import { PodcastSearchResult, PodcastEpisode, EpisodeListResponse } from '../types';
+import { PodcastSearchResult, PodcastEpisode, EpisodeListResponse, IngestionTask } from '../types';
 
 export const podcastsApi = {
   // Search podcasts via Podcast Index API
@@ -46,6 +46,30 @@ export const podcastsApi = {
   // Get a single episode by ID (for polling status)
   getEpisode: async (episodeId: number): Promise<PodcastEpisode> => {
     const response = await apiClient.get(`/podcasts/${episodeId}`);
+    return response.data;
+  },
+
+  // Process podcast episode (download → transcribe → index)
+  processPodcast: async (episodeId: number): Promise<IngestionTask> => {
+    const response = await apiClient.post(`/podcasts/process/${episodeId}`);
+    return response.data;
+  },
+
+  // Get processing status
+  getProcessingStatus: async (taskId: string): Promise<IngestionTask> => {
+    const response = await apiClient.get(`/podcasts/process/status/${taskId}`);
+    return response.data;
+  },
+
+  // Check if episode has been analyzed
+  checkAnalyzed: async (episodeId: number): Promise<{ analyzed: boolean; insight_count: number }> => {
+    const response = await apiClient.get(`/podcasts/${episodeId}/analyzed`);
+    return response.data;
+  },
+
+  // Get episode processing status
+  getEpisodeProcessingStatus: async (episodeId: number): Promise<{ status: string }> => {
+    const response = await apiClient.get(`/podcasts/${episodeId}/processing-status`);
     return response.data;
   },
 };
