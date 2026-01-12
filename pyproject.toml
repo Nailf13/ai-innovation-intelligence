@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "innovation_intelligence"
+version = "0.1.0"
+description = "Health insights extraction and analysis from podcasts and documents."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Nail Ferroukhi" }
+]
+
+dependencies = [
+  "sqlalchemy>=2.0",
+  "psycopg2-binary",
+  "pgvector",
+  "boto3",
+  "python-dotenv",
+  "sentence-transformers",
+  "numpy",
+  "pymupdf",
+  "fastapi>=0.100",
+  "uvicorn[standard]",
+  "python-multipart",
+  "httpx",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "pytest-cov",
+]
+
+[project.scripts]
+init-db = "innovation_intelligence.cli.init_db:main"
+index-vectors = "innovation_intelligence.cli.index_vectors:main"
+assess-dimensions = "innovation_intelligence.cli.assess_dimensions:main"
+analyze = "innovation_intelligence.cli.analyze:main"
+ingest-podcasts = "innovation_intelligence.cli.ingest_podcasts:main"
+ingest-documents = "innovation_intelligence.cli.ingest_documents:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: innovation_intelligence_pg
+    restart: always
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data_v4:/var/lib/postgresql/data
+
+volumes:
+  postgres_data_v4:
