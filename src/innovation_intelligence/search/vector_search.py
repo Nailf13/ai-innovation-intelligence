@@ -24,7 +24,7 @@ log = get_logger(__name__)
 class SearchQuery:
     """Search query configuration."""
     query_text: str
-    top_k: int = 10
+    top_k: int = 3
     include_podcasts: bool = True
     include_documents: bool = True
     source_filter: Optional[str] = None
@@ -56,7 +56,7 @@ class VectorSearchService:
     def search(
         self,
         query: str | SearchQuery,
-        top_k: int = 10,
+        top_k: int = 3,
     ) -> List[SearchResult]:
         """
         Search for relevant chunks.
@@ -107,7 +107,7 @@ class VectorSearchService:
     def search_podcasts(
         self,
         query: str,
-        top_k: int = 10,
+        top_k: int = 3,
         source_filter: Optional[str] = None,
         speaker_filter: Optional[str] = None,
     ) -> List[SearchResult]:
@@ -134,7 +134,7 @@ class VectorSearchService:
     def search_documents(
         self,
         query: str,
-        top_k: int = 10,
+        top_k: int = 3,
         source_filter: Optional[str] = None,
     ) -> List[SearchResult]:
         """
@@ -165,7 +165,7 @@ class VectorSearchService:
 
 def search_chunks(
     query: str,
-    top_k: int = 10,
+    top_k: int = 3,
     include_podcasts: bool = True,
     include_documents: bool = True,
 ) -> List[SearchResult]:

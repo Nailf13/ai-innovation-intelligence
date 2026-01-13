@@ -1,14 +1,14 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Header } from '../components/layout';
 import { LoadingState, EmptyState } from '../components/common';
-import { podcastsApi, analysisApi, ingestionApi } from '../api';
+import { podcastsApi, analysisApi } from '../api';
 import { PodcastEpisode, PodcastSearchResult, PodcastEpisodeInfo } from '../types';
+import { useSSE } from '../hooks/useSSE';
 import {
   Search,
   Mic,
   Play,
-  Download,
   CheckCircle,
   Plus,
   X,
@@ -20,6 +20,20 @@ import {
 } from 'lucide-react';
 import { format } from 'date-fns';
 import clsx from 'clsx';
+
+// Format duration from seconds to HH:MM:SS or MM:SS
+const formatDuration = (seconds: number | undefined): string => {
+  if (!seconds) return '';
+
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  }
+  return `${minutes}:${secs.toString().padStart(2, '0')}`;
+};
 
 export function PodcastsPage() {
   const queryClient = useQueryClient();
@@ -33,23 +47,64 @@ export function PodcastsPage() {
   const [hasMoreEpisodes, setHasMoreEpisodes] = useState(false);
   const [nextOffset, setNextOffset] = useState<number | undefined>(undefined);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [downloadingIds, setDownloadingIds] = useState<Set<number>>(new Set());
-  const [transcribingIds, setTranscribingIds] = useState<Set<number>>(new Set());
-  const pollingIntervals = useRef<Map<number, ReturnType<typeof setInterval>>>(new Map());
-  const transcriptionPolling = useRef<Map<number, ReturnType<typeof setInterval>>>(new Map());
 
-  // Cleanup polling intervals on unmount
-  useEffect(() => {
-    return () => {
-      pollingIntervals.current.forEach((interval) => clearInterval(interval));
-      transcriptionPolling.current.forEach((interval) => clearInterval(interval));
-    };
-  }, []);
+  // Connect to SSE for real-time status updates
+  useSSE({
+    url: 'http://localhost:8000/podcasts/events',
+    onMessage: (event) => {
+      if (event.type === 'episode_status') {
+        console.log(`[SSE] Episode ${event.episode_id} status changed to ${event.status}`);
+
+        // Invalidate and refetch the specific episode status query
+        queryClient.invalidateQueries({
+          queryKey: ['podcast', event.episode_id, 'status'],
+          refetchType: 'active', // Refetch active queries immediately
+        });
+
+        // Also invalidate the saved podcasts list to ensure UI consistency
+        queryClient.invalidateQueries({
+          queryKey: ['podcasts', 'saved'],
+          refetchType: 'active',
+        });
+      } else if (event.type === 'analysis_status') {
+        console.log(`[SSE] Analysis task ${event.task_id} status: ${event.status}`);
+
+        // Invalidate analysis-related queries
+        queryClient.invalidateQueries({
+          queryKey: ['analysis', 'tasks'],
+          refetchType: 'active',
+        });
+        queryClient.invalidateQueries({
+          queryKey: ['analysis', 'stats'],
+          refetchType: 'active',
+        });
+
+        // Also invalidate all episode statuses when analysis completes or fails
+        if (event.status === 'completed' || event.status === 'failed') {
+          queryClient.invalidateQueries({
+            queryKey: ['podcast'],
+            refetchType: 'active',
+          });
+        }
+      }
+    },
+    onError: (error) => {
+      console.error('SSE connection error:', error);
+    },
+    onOpen: () => {
+      console.log('SSE connection established');
+    },
+  });
 
   // Fetch saved podcasts
-  const { data: savedPodcasts = [], isLoading: loadingSaved } = useQuery({
+  const { data: rawSavedPodcasts = [], isLoading: loadingSaved } = useQuery({
     queryKey: ['podcasts', 'saved'],
     queryFn: podcastsApi.listSaved,
+  });
+
+  // Sort podcasts by created_at (newest first)
+  const savedPodcasts = [...rawSavedPodcasts].sort((a, b) => {
+    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
   });
 
   // Search mutation
@@ -94,130 +149,19 @@ export function PodcastsPage() {
     mutationFn: () => analysisApi.run({ runExtraction: true, runDimensionAssessment: true }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['analysis', 'tasks'] });
+      // SSE will handle real-time status updates, so no need for manual polling
     },
   });
 
-  // Start polling for download completion
-  const startDownloadPolling = (episodeId: number) => {
-    // Clear any existing interval for this episode
-    const existing = pollingIntervals.current.get(episodeId);
-    if (existing) clearInterval(existing);
-
-    const interval = setInterval(async () => {
-      try {
-        const episode = await podcastsApi.getEpisode(episodeId);
-        if (episode.audio_path) {
-          // Download complete, stop polling and update UI
-          clearInterval(interval);
-          pollingIntervals.current.delete(episodeId);
-          setDownloadingIds((prev) => {
-            const next = new Set(prev);
-            next.delete(episodeId);
-            return next;
-          });
-          // Refresh the podcasts list to show updated status
-          queryClient.invalidateQueries({ queryKey: ['podcasts', 'saved'] });
-        }
-      } catch (error) {
-        console.error('Error polling episode status:', error);
-      }
-    }, 2000); // Poll every 2 seconds
-
-    pollingIntervals.current.set(episodeId, interval);
-
-    // Stop polling after 5 minutes to avoid infinite polling
-    setTimeout(() => {
-      const int = pollingIntervals.current.get(episodeId);
-      if (int) {
-        clearInterval(int);
-        pollingIntervals.current.delete(episodeId);
-        setDownloadingIds((prev) => {
-          const next = new Set(prev);
-          next.delete(episodeId);
-          return next;
-        });
-      }
-    }, 5 * 60 * 1000);
-  };
-
-  // Download audio handler
-  const handleDownload = async (episodeId: number) => {
-    setDownloadingIds((prev) => new Set(prev).add(episodeId));
+  // Process handler (download → transcribe → index)
+  const handleProcess = async (episodeId: number) => {
     try {
-      await podcastsApi.downloadAudio(episodeId);
-      // Start polling for completion
-      startDownloadPolling(episodeId);
+      await podcastsApi.processPodcast(episodeId);
+      // SSE will handle real-time status updates
     } catch (error) {
-      console.error('Error starting download:', error);
-      setDownloadingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(episodeId);
-        return next;
-      });
+      console.error('Error starting processing:', error);
     }
   };
-
-  // Start polling for transcription completion
-  const startTranscriptionPolling = (episodeId: number, taskId: string) => {
-    // Clear any existing interval for this episode
-    const existing = transcriptionPolling.current.get(episodeId);
-    if (existing) clearInterval(existing);
-
-    const interval = setInterval(async () => {
-      try {
-        const status = await ingestionApi.getStatus(taskId);
-        if (status.status === 'completed' || status.status === 'failed') {
-          // Transcription finished, stop polling and update UI
-          clearInterval(interval);
-          transcriptionPolling.current.delete(episodeId);
-          setTranscribingIds((prev) => {
-            const next = new Set(prev);
-            next.delete(episodeId);
-            return next;
-          });
-          // Refresh the podcasts list to show updated status
-          queryClient.invalidateQueries({ queryKey: ['podcasts', 'saved'] });
-        }
-      } catch (error) {
-        console.error('Error polling transcription status:', error);
-      }
-    }, 3000); // Poll every 3 seconds
-
-    transcriptionPolling.current.set(episodeId, interval);
-
-    // Stop polling after 30 minutes (transcription can take a while)
-    setTimeout(() => {
-      const int = transcriptionPolling.current.get(episodeId);
-      if (int) {
-        clearInterval(int);
-        transcriptionPolling.current.delete(episodeId);
-        setTranscribingIds((prev) => {
-          const next = new Set(prev);
-          next.delete(episodeId);
-          return next;
-        });
-      }
-    }, 30 * 60 * 1000);
-  };
-
-  // Transcribe audio handler
-  const handleTranscribe = async (episodeId: number) => {
-    setTranscribingIds((prev) => new Set(prev).add(episodeId));
-    try {
-      const task = await ingestionApi.transcribe(episodeId);
-      // Start polling for completion
-      startTranscriptionPolling(episodeId, task.task_id);
-    } catch (error) {
-      console.error('Error starting transcription:', error);
-      setTranscribingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(episodeId);
-        return next;
-      });
-    }
-  };
-
-  const isTranscribing = (episodeId: number) => transcribingIds.has(episodeId);
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
@@ -274,9 +218,44 @@ export function PodcastsPage() {
     }
   };
 
-  const hasTranscript = (podcast: PodcastEpisode) => !!podcast.transcript_path;
-  const hasAudio = (podcast: PodcastEpisode) => !!podcast.audio_path;
-  const isDownloading = (episodeId: number) => downloadingIds.has(episodeId);
+  // Get episode status from backend (cached with React Query)
+  // SSE updates will automatically invalidate these queries for real-time updates
+  const useEpisodeStatus = (episodeId: number) => {
+    return useQuery({
+      queryKey: ['podcast', episodeId, 'status'],
+      queryFn: () => podcastsApi.getEpisodeProcessingStatus(episodeId),
+      // Refetch immediately when query is invalidated by SSE
+      staleTime: 0, // Always consider data stale so invalidation triggers refetch
+      refetchOnMount: true,
+      refetchOnWindowFocus: false, // Don't refetch on window focus
+    });
+  };
+
+  // Status helper functions based on backend status
+  const getStatusInfo = (statusResponse: { status: string } | undefined) => {
+    if (!statusResponse) return { status: 'loading', label: 'Loading...', needsAction: false, isProcessing: false };
+
+    const { status } = statusResponse;
+
+    switch (status) {
+      case 'analyzed':
+        return { status: 'analyzed', label: 'Analyzed', needsAction: false, isProcessing: false };
+      case 'analyzing':
+        return { status: 'analyzing', label: 'Analyzing...', needsAction: false, isProcessing: true };
+      case 'ready':
+        return { status: 'ready', label: 'Ready to analyze', needsAction: false, isProcessing: false };
+      case 'downloading':
+        return { status: 'downloading', label: 'Downloading...', needsAction: false, isProcessing: true };
+      case 'transcribing':
+        return { status: 'transcribing', label: 'Transcribing...', needsAction: false, isProcessing: true };
+      case 'indexing':
+        return { status: 'indexing', label: 'Indexing...', needsAction: false, isProcessing: true };
+      case 'needs_processing':
+        return { status: 'needs_processing', label: 'Needs processing', needsAction: true, isProcessing: false };
+      default:
+        return { status: 'unknown', label: 'Unknown', needsAction: false, isProcessing: false };
+    }
+  };
 
   return (
     <div className="h-full flex flex-col">
@@ -302,7 +281,7 @@ export function PodcastsPage() {
               className="btn btn-secondary flex items-center gap-2"
             >
               <Play className="w-4 h-4" />
-              Run Analysis
+              Run Pipeline
             </button>
           </div>
 
@@ -337,93 +316,13 @@ export function PodcastsPage() {
         ) : (
           <div className="grid gap-4">
             {savedPodcasts.map((podcast) => (
-              <div
+              <PodcastCard
                 key={podcast.id}
-                className="card p-4 hover:shadow-md transition-shadow"
-              >
-                <div className="flex items-start justify-between">
-                  <div className="flex-1">
-                    <div className="flex items-center gap-3 mb-2">
-                      <div className="w-10 h-10 bg-purple-100 rounded-lg flex items-center justify-center">
-                        <Mic className="w-5 h-5 text-purple-600" />
-                      </div>
-                      <div>
-                        <h3 className="font-medium text-gray-900">
-                          {podcast.episode_title}
-                        </h3>
-                        <p className="text-sm text-gray-500">
-                          {podcast.podcast_name}
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-4 text-sm text-gray-500">
-                      {podcast.episode_date && (
-                        <span className="flex items-center gap-1">
-                          <Calendar className="w-4 h-4" />
-                          {format(new Date(podcast.episode_date), 'MMM d, yyyy')}
-                        </span>
-                      )}
-                      <span className="flex items-center gap-1">
-                        {hasTranscript(podcast) ? (
-                          <>
-                            <CheckCircle className="w-4 h-4 text-green-500" />
-                            Transcribed
-                          </>
-                        ) : hasAudio(podcast) ? (
-                          <>
-                            <Clock className="w-4 h-4 text-yellow-500" />
-                            Pending transcription
-                          </>
-                        ) : (
-                          <>
-                            <Download className="w-4 h-4 text-gray-400" />
-                            Needs download
-                          </>
-                        )}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    {!hasAudio(podcast) && podcast.audio_url && (
-                      <button
-                        onClick={() => handleDownload(podcast.id)}
-                        disabled={isDownloading(podcast.id)}
-                        className="btn btn-sm btn-secondary flex items-center gap-1"
-                      >
-                        {isDownloading(podcast.id) ? (
-                          <>
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            Downloading...
-                          </>
-                        ) : (
-                          <>
-                            <Download className="w-4 h-4" />
-                            Download
-                          </>
-                        )}
-                      </button>
-                    )}
-                    {hasAudio(podcast) && !hasTranscript(podcast) && (
-                      <button
-                        onClick={() => handleTranscribe(podcast.id)}
-                        disabled={isTranscribing(podcast.id)}
-                        className="btn btn-sm btn-primary flex items-center gap-1"
-                      >
-                        {isTranscribing(podcast.id) ? (
-                          <>
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            Transcribing...
-                          </>
-                        ) : (
-                          'Transcribe'
-                        )}
-                      </button>
-                    )}
-                  </div>
-                </div>
-              </div>
+                podcast={podcast}
+                onProcess={handleProcess}
+                getStatusInfo={getStatusInfo}
+                useEpisodeStatus={useEpisodeStatus}
+              />
             ))}
           </div>
         )}
@@ -515,11 +414,20 @@ export function PodcastsPage() {
                               <p className="font-medium text-sm truncate">
                                 {ep.title}
                               </p>
-                              {ep.date_published && (
-                                <p className="text-xs text-gray-500">
-                                  {format(new Date(ep.date_published), 'MMM d, yyyy')}
-                                </p>
-                              )}
+                              <div className="flex items-center gap-3 mt-1">
+                                {ep.date_published && (
+                                  <span className="text-xs text-gray-500 flex items-center gap-1">
+                                    <Calendar className="w-3 h-3" />
+                                    {format(new Date(ep.date_published), 'MMM d, yyyy')}
+                                  </span>
+                                )}
+                                {ep.duration && (
+                                  <span className="text-xs text-gray-500 flex items-center gap-1">
+                                    <Clock className="w-3 h-3" />
+                                    {formatDuration(ep.duration)}
+                                  </span>
+                                )}
+                              </div>
                             </div>
                           </label>
                         ))}
@@ -613,6 +521,111 @@ export function PodcastsPage() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// Separate component for podcast card that fetches its own status
+interface PodcastCardProps {
+  podcast: PodcastEpisode;
+  onProcess: (id: number) => Promise<void>;
+  getStatusInfo: (statusResponse: { status: string } | undefined) => {
+    status: string;
+    label: string;
+    needsAction: boolean;
+    isProcessing: boolean;
+  };
+  useEpisodeStatus: (episodeId: number) => {
+    data: { status: string } | undefined;
+    isLoading: boolean;
+  };
+}
+
+function PodcastCard({ podcast, onProcess, getStatusInfo, useEpisodeStatus }: PodcastCardProps) {
+  const { data: statusData, isLoading: statusLoading } = useEpisodeStatus(podcast.id);
+  const statusInfo = getStatusInfo(statusData);
+
+  const handleProcessClick = async () => {
+    await onProcess(podcast.id);
+    // SSE will automatically update status in real-time
+  };
+
+  // Determine if button should be shown
+  const shouldShowProcessButton = statusInfo.needsAction && !statusInfo.isProcessing;
+
+  // Status icon and color
+  const getStatusIcon = () => {
+    switch (statusInfo.status) {
+      case 'analyzed':
+        return <CheckCircle className="w-4 h-4 text-blue-500" />;
+      case 'analyzing':
+        return <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />;
+      case 'ready':
+        return <CheckCircle className="w-4 h-4 text-green-500" />;
+      case 'downloading':
+      case 'transcribing':
+      case 'indexing':
+        return <Loader2 className="w-4 h-4 text-yellow-500 animate-spin" />;
+      case 'needs_processing':
+        return <Clock className="w-4 h-4 text-gray-400" />;
+      default:
+        return <Clock className="w-4 h-4 text-gray-400" />;
+    }
+  };
+
+  return (
+    <div className="card p-4 hover:shadow-md transition-shadow">
+      <div className="flex items-start justify-between">
+        <div className="flex-1">
+          <div className="flex items-center gap-3 mb-2">
+            <div className="w-10 h-10 bg-purple-100 rounded-lg flex items-center justify-center">
+              <Mic className="w-5 h-5 text-purple-600" />
+            </div>
+            <div>
+              <h3 className="font-medium text-gray-900">
+                {podcast.episode_title}
+              </h3>
+              <p className="text-sm text-gray-500">
+                {podcast.podcast_name}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-4 text-sm text-gray-500">
+            {podcast.episode_date && (
+              <span className="flex items-center gap-1">
+                <Calendar className="w-4 h-4" />
+                {format(new Date(podcast.episode_date), 'MMM d, yyyy')}
+              </span>
+            )}
+            <span className="flex items-center gap-1">
+              {statusLoading ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Loading status...
+                </>
+              ) : (
+                <>
+                  {getStatusIcon()}
+                  {statusInfo.label}
+                </>
+              )}
+            </span>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {shouldShowProcessButton && (
+            <button
+              onClick={handleProcessClick}
+              className="btn btn-sm btn-primary flex items-center gap-1"
+            >
+              <Play className="w-4 h-4" />
+              Process
+            </button>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
