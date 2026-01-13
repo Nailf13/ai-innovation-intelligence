@@ -1,31 +1,29 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Header } from '../components/layout';
 import {
   LoadingState,
   EmptyState,
-  SourceBadge,
-  AdoptionBadge,
-  AdoptionLegend,
-  AudioPlayer,
 } from '../components/common';
+import { ScatterPlotVisualization } from '../components/ScatterPlotVisualization';
+import { NetworkVisualization } from '../components/NetworkVisualization';
+import { DetailPanel } from '../components/DetailPanel';
+import { VideoModal } from '../components/VideoModal';
+import { PdfModal } from '../components/PdfModal';
 import { insightsApi } from '../api';
-import { UnitInsight, MacroInsight, Cluster, InsightHierarchy, Dimension } from '../types';
+import { InsightHierarchy, VisualizationData } from '../types';
 import {
   Sparkles,
-  X,
-  ChevronRight,
   TrendingUp,
   AlertCircle,
-  Mic,
-  FileText,
-  Clock,
-  ExternalLink,
-  Layers,
-  Circle,
+  BarChart3,
+  Network,
 } from 'lucide-react';
-import * as d3 from 'd3';
 import clsx from 'clsx';
+
+// ============================================
+// Types
+// ============================================
 
 type SelectionType = 'cluster' | 'macro' | 'unit' | null;
 
@@ -34,14 +32,56 @@ interface Selection {
   id: number;
 }
 
+// ============================================
+// Color Constants
+// ============================================
+
+const TYPE_COLORS = {
+  trend: '#3b82f6',
+  health_stake: '#f97316',
+  cluster: '#d1e3f5',
+  macro: '#22c55e',
+};
+
+const STAGE_COLORS: Record<string, string> = {
+  'Nascent experimentation': '#c4b5fd',
+  'Early adoption': '#93c5fd',
+  'Crossing the chasm': '#41f1ce',
+  'Established practice': '#fcd34d',
+};
+
+// ============================================
+// Main Page Component
+// ============================================
+
 export function InsightsPage() {
   const [selection, setSelection] = useState<Selection | null>(null);
-  const svgRef = useRef<SVGSVGElement>(null);
+  const [viewMode, setViewMode] = useState<'network' | 'trends' | 'stakes'>('network');
+  const [videoModal, setVideoModal] = useState<{
+    open: boolean;
+    url?: string;
+    start?: number;
+    end?: number;
+    title?: string;
+    subtitle?: string;
+  }>({ open: false });
+  const [pdfModal, setPdfModal] = useState<{
+    open: boolean;
+    page?: number;
+    path?: string;
+  }>({ open: false });
 
   // Fetch hierarchy
   const { data: hierarchy, isLoading } = useQuery({
     queryKey: ['insights', 'hierarchy'],
     queryFn: insightsApi.getHierarchy,
+  });
+
+  // Fetch visualization data
+  const { data: vizData, isLoading: isLoadingViz } = useQuery({
+    queryKey: ['insights', 'visualization'],
+    queryFn: insightsApi.getVisualizationData,
+    enabled: viewMode !== 'network',
   });
 
   // Fetch selected item details
@@ -67,530 +107,226 @@ export function InsightsPage() {
     setSelection({ type, id });
   }, []);
 
+  const handleClosePanel = useCallback(() => {
+    setSelection(null);
+  }, []);
+
+  const handleOpenVideo = useCallback((url: string, start: number, end?: number, title?: string, subtitle?: string) => {
+    setVideoModal({ open: true, url, start, end, title, subtitle });
+  }, []);
+
+  const handleCloseVideo = useCallback(() => {
+    setVideoModal({ open: false });
+  }, []);
+
+  const handleOpenPdf = useCallback((page: number, path?: string) => {
+    setPdfModal({ open: true, page, path });
+  }, []);
+
+  const handleClosePdf = useCallback(() => {
+    setPdfModal({ open: false });
+  }, []);
+
+  // Keyboard shortcut for closing modals
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (videoModal.open) handleCloseVideo();
+        if (pdfModal.open) handleClosePdf();
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [videoModal.open, pdfModal.open, handleCloseVideo, handleClosePdf]);
+
   return (
-    <div className="h-full flex flex-col">
+    <div className="h-full flex flex-col overflow-hidden">
       <Header
-        title="Health Trends Insights"
-        subtitle="Explore discovered trends and health stakes"
+        title="Health Trends Network Visualization"
+        subtitle="Interactive exploration of emerging health innovations and adoption patterns"
       />
 
-      <div className="flex-1 flex overflow-hidden">
-        {/* Left Panel - Visualization */}
-        <div className="flex-1 p-6 overflow-auto">
-          {/* Legend */}
-          <div className="mb-4 flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <div className="flex items-center gap-2">
-                <div className="w-4 h-4 rounded-full bg-savencia-primary" />
-                <span className="text-sm text-gray-600">Cluster</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="w-3 h-3 rounded-full bg-green-500" />
-                <span className="text-sm text-gray-600">Macro Insight</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="w-2 h-2 rounded-full bg-purple-500" />
-                <span className="text-sm text-gray-600">Trend</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="w-2 h-2 rounded-full bg-amber-500" />
-                <span className="text-sm text-gray-600">Health Stake</span>
-              </div>
-            </div>
-            <AdoptionLegend />
-          </div>
-
-          {isLoading ? (
-            <LoadingState message="Loading insights..." />
-          ) : !hierarchy || (hierarchy.clusters.length === 0 && hierarchy.orphan_unit_insights.length === 0) ? (
-            <EmptyState
-              icon={Sparkles}
-              title="No insights yet"
-              description="Run the analysis pipeline to discover health trends and insights."
-            />
-          ) : (
-            <ClusterVisualization
-              hierarchy={hierarchy}
-              selection={selection}
-              onNodeClick={handleNodeClick}
-            />
-          )}
+      {/* View Mode Toggle */}
+      <div className="px-6 py-3 bg-white border-b border-gray-200">
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setViewMode('network')}
+            className={clsx(
+              'flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors',
+              viewMode === 'network'
+                ? 'bg-blue-100 text-blue-700'
+                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+            )}
+          >
+            <Network className="w-4 h-4" />
+            Network View
+          </button>
+          <button
+            onClick={() => setViewMode('trends')}
+            className={clsx(
+              'flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors',
+              viewMode === 'trends'
+                ? 'bg-blue-100 text-blue-700'
+                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+            )}
+          >
+            <BarChart3 className="w-4 h-4" />
+            Trends View
+          </button>
+          <button
+            onClick={() => setViewMode('stakes')}
+            className={clsx(
+              'flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors',
+              viewMode === 'stakes'
+                ? 'bg-blue-100 text-blue-700'
+                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+            )}
+          >
+            <AlertCircle className="w-4 h-4" />
+            Stakes View
+          </button>
         </div>
-
-        {/* Right Panel - Details */}
-        {selection && (
-          <DetailPanel
-            selection={selection}
-            cluster={selectedCluster}
-            macro={selectedMacro}
-            unit={selectedUnit}
-            onClose={() => setSelection(null)}
-            onSelectMacro={(id) => setSelection({ type: 'macro', id })}
-            onSelectUnit={(id) => setSelection({ type: 'unit', id })}
-          />
-        )}
-      </div>
-    </div>
-  );
-}
-
-interface ClusterVisualizationProps {
-  hierarchy: InsightHierarchy;
-  selection: Selection | null;
-  onNodeClick: (type: SelectionType, id: number) => void;
-}
-
-function ClusterVisualization({ hierarchy, selection, onNodeClick }: ClusterVisualizationProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const svgRef = useRef<SVGSVGElement>(null);
-
-  useEffect(() => {
-    if (!containerRef.current || !svgRef.current) return;
-
-    const width = containerRef.current.clientWidth;
-    const height = containerRef.current.clientHeight;
-
-    // Clear previous content
-    d3.select(svgRef.current).selectAll('*').remove();
-
-    const svg = d3.select(svgRef.current)
-      .attr('width', width)
-      .attr('height', height);
-
-    // Create nodes data
-    const nodes: any[] = [];
-    const links: any[] = [];
-
-    // Add clusters
-    hierarchy.clusters.forEach((cluster) => {
-      nodes.push({
-        id: `cluster-${cluster.id}`,
-        type: 'cluster',
-        data: cluster,
-        radius: 30,
-        color: '#0066B3',
-      });
-
-      // Add macro insights
-      cluster.macro_insights.forEach((macro) => {
-        nodes.push({
-          id: `macro-${macro.id}`,
-          type: 'macro',
-          data: macro,
-          radius: 18,
-          color: '#22c55e',
-        });
-        links.push({
-          source: `cluster-${cluster.id}`,
-          target: `macro-${macro.id}`,
-        });
-
-        // Add unit insights
-        macro.unit_insights.forEach((unit) => {
-          nodes.push({
-            id: `unit-${unit.id}`,
-            type: 'unit',
-            data: unit,
-            radius: 8,
-            color: unit.type === 'trend' ? '#8b5cf6' : '#f59e0b',
-          });
-          links.push({
-            source: `macro-${macro.id}`,
-            target: `unit-${unit.id}`,
-          });
-        });
-      });
-    });
-
-    // Add unassigned macro insights
-    hierarchy.unassigned_macro_insights.forEach((macro) => {
-      nodes.push({
-        id: `macro-${macro.id}`,
-        type: 'macro',
-        data: macro,
-        radius: 18,
-        color: '#22c55e',
-      });
-
-      macro.unit_insights.forEach((unit) => {
-        nodes.push({
-          id: `unit-${unit.id}`,
-          type: 'unit',
-          data: unit,
-          radius: 8,
-          color: unit.type === 'trend' ? '#8b5cf6' : '#f59e0b',
-        });
-        links.push({
-          source: `macro-${macro.id}`,
-          target: `unit-${unit.id}`,
-        });
-      });
-    });
-
-    // Add orphan unit insights
-    hierarchy.orphan_unit_insights.forEach((unit) => {
-      nodes.push({
-        id: `unit-${unit.id}`,
-        type: 'unit',
-        data: unit,
-        radius: 8,
-        color: unit.type === 'trend' ? '#8b5cf6' : '#f59e0b',
-      });
-    });
-
-    // Create force simulation
-    const simulation = d3.forceSimulation(nodes)
-      .force('link', d3.forceLink(links).id((d: any) => d.id).distance(60))
-      .force('charge', d3.forceManyBody().strength(-150))
-      .force('center', d3.forceCenter(width / 2, height / 2))
-      .force('collision', d3.forceCollide().radius((d: any) => d.radius + 5));
-
-    // Draw links
-    const link = svg.append('g')
-      .selectAll('line')
-      .data(links)
-      .enter()
-      .append('line')
-      .attr('stroke', '#e5e7eb')
-      .attr('stroke-width', 1);
-
-    // Draw nodes
-    const node = svg.append('g')
-      .selectAll('circle')
-      .data(nodes)
-      .enter()
-      .append('circle')
-      .attr('r', (d: any) => d.radius)
-      .attr('fill', (d: any) => d.color)
-      .attr('stroke', (d: any) => {
-        const isSelected = selection &&
-          selection.type === d.type &&
-          selection.id === d.data.id;
-        return isSelected ? '#000' : 'transparent';
-      })
-      .attr('stroke-width', 3)
-      .style('cursor', 'pointer')
-      .on('click', (event: any, d: any) => {
-        onNodeClick(d.type, d.data.id);
-      });
-
-    // Add tooltips
-    node.append('title')
-      .text((d: any) => d.data.name);
-
-    // Add labels for clusters
-    const labels = svg.append('g')
-      .selectAll('text')
-      .data(nodes.filter((n) => n.type === 'cluster'))
-      .enter()
-      .append('text')
-      .text((d: any) => d.data.name)
-      .attr('font-size', 10)
-      .attr('fill', '#374151')
-      .attr('text-anchor', 'middle')
-      .attr('dy', (d: any) => d.radius + 14);
-
-    // Update positions
-    simulation.on('tick', () => {
-      link
-        .attr('x1', (d: any) => d.source.x)
-        .attr('y1', (d: any) => d.source.y)
-        .attr('x2', (d: any) => d.target.x)
-        .attr('y2', (d: any) => d.target.y);
-
-      node
-        .attr('cx', (d: any) => d.x)
-        .attr('cy', (d: any) => d.y);
-
-      labels
-        .attr('x', (d: any) => d.x)
-        .attr('y', (d: any) => d.y);
-    });
-
-    // Drag behavior
-    node.call(
-      d3.drag<SVGCircleElement, any>()
-        .on('start', (event, d) => {
-          if (!event.active) simulation.alphaTarget(0.3).restart();
-          d.fx = d.x;
-          d.fy = d.y;
-        })
-        .on('drag', (event, d) => {
-          d.fx = event.x;
-          d.fy = event.y;
-        })
-        .on('end', (event, d) => {
-          if (!event.active) simulation.alphaTarget(0);
-          d.fx = null;
-          d.fy = null;
-        })
-    );
-
-    return () => {
-      simulation.stop();
-    };
-  }, [hierarchy, selection, onNodeClick]);
-
-  return (
-    <div ref={containerRef} className="w-full h-[600px] bg-white rounded-xl border border-gray-200">
-      <svg ref={svgRef} className="w-full h-full" />
-    </div>
-  );
-}
-
-interface DetailPanelProps {
-  selection: Selection;
-  cluster?: Cluster;
-  macro?: MacroInsight;
-  unit?: UnitInsight;
-  onClose: () => void;
-  onSelectMacro: (id: number) => void;
-  onSelectUnit: (id: number) => void;
-}
-
-function DetailPanel({
-  selection,
-  cluster,
-  macro,
-  unit,
-  onClose,
-  onSelectMacro,
-  onSelectUnit,
-}: DetailPanelProps) {
-  return (
-    <div className="w-[450px] bg-white border-l border-gray-200 flex flex-col slide-in">
-      {/* Header */}
-      <div className="flex items-center justify-between p-4 border-b">
-        <h2 className="font-semibold text-gray-900">
-          {selection.type === 'cluster' && 'Strategic Cluster'}
-          {selection.type === 'macro' && 'Macro Insight'}
-          {selection.type === 'unit' && 'Unit Insight'}
-        </h2>
-        <button
-          onClick={onClose}
-          className="p-2 hover:bg-gray-100 rounded-lg"
-        >
-          <X className="w-5 h-5" />
-        </button>
       </div>
 
-      {/* Content */}
-      <div className="flex-1 overflow-auto p-4">
-        {selection.type === 'cluster' && cluster && (
-          <ClusterDetail
-            cluster={cluster}
-            onSelectMacro={onSelectMacro}
-          />
-        )}
-        {selection.type === 'macro' && macro && (
-          <MacroDetail
-            macro={macro}
-            onSelectUnit={onSelectUnit}
-          />
-        )}
-        {selection.type === 'unit' && unit && (
-          <UnitDetail unit={unit} />
-        )}
-      </div>
-    </div>
-  );
-}
+      <div className="flex-1 relative overflow-hidden">
+        {viewMode === 'network' ? (
+          <>
+            {isLoading ? (
+              <div className="flex items-center justify-center h-full">
+                <LoadingState message="Loading insights..." />
+              </div>
+            ) : !hierarchy || (hierarchy.clusters.length === 0 && hierarchy.orphan_unit_insights.length === 0) ? (
+              <div className="flex items-center justify-center h-full">
+                <EmptyState
+                  icon={Sparkles}
+                  title="No insights yet"
+                  description="Run the analysis pipeline to discover health trends and insights."
+                />
+              </div>
+            ) : (
+              <NetworkVisualization
+                hierarchy={hierarchy}
+                selection={selection}
+                onNodeClick={handleNodeClick}
+              />
+            )}
 
-function ClusterDetail({ cluster, onSelectMacro }: { cluster: Cluster; onSelectMacro: (id: number) => void }) {
-  return (
-    <div>
-      <h3 className="text-xl font-semibold text-gray-900 mb-2">{cluster.name}</h3>
-      {cluster.description && (
-        <p className="text-gray-600 mb-4">{cluster.description}</p>
-      )}
+            {/* Floating Legend */}
+            <NetworkLegend />
 
-      <div className="mb-4">
-        <span className="text-sm text-gray-500">
-          {cluster.macro_insight_count} macro insights
-        </span>
-      </div>
-
-      <h4 className="font-medium text-gray-900 mb-3">Macro Insights</h4>
-      <div className="space-y-2">
-        {cluster.macro_insights?.map((macro) => (
-          <button
-            key={macro.id}
-            onClick={() => onSelectMacro(macro.id)}
-            className="w-full text-left p-3 bg-gray-50 hover:bg-gray-100 rounded-lg transition-colors"
-          >
-            <div className="flex items-center justify-between">
-              <span className="font-medium text-gray-900">{macro.name}</span>
-              <ChevronRight className="w-4 h-4 text-gray-400" />
+            {/* Controls Hint */}
+            <div className="network-controls">
+              <strong>Controls:</strong>
+              Scroll to zoom • Click & drag to pan • Click nodes for details
             </div>
-            <span className="text-sm text-gray-500">
-              {macro.unit_insight_count} insights
-            </span>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function MacroDetail({ macro, onSelectUnit }: { macro: MacroInsight; onSelectUnit: (id: number) => void }) {
-  return (
-    <div>
-      <h3 className="text-xl font-semibold text-gray-900 mb-2">{macro.name}</h3>
-      {macro.description && (
-        <p className="text-gray-600 mb-4">{macro.description}</p>
-      )}
-
-      <div className="mb-4">
-        <span className="text-sm text-gray-500">
-          {macro.unit_insight_count} unit insights
-        </span>
-      </div>
-
-      <h4 className="font-medium text-gray-900 mb-3">Unit Insights</h4>
-      <div className="space-y-2">
-        {macro.unit_insights?.map((unit) => (
-          <button
-            key={unit.id}
-            onClick={() => onSelectUnit(unit.id)}
-            className="w-full text-left p-3 bg-gray-50 hover:bg-gray-100 rounded-lg transition-colors"
-          >
-            <div className="flex items-center gap-2 mb-1">
-              {unit.type === 'trend' ? (
-                <TrendingUp className="w-4 h-4 text-purple-500" />
-              ) : (
-                <AlertCircle className="w-4 h-4 text-amber-500" />
-              )}
-              <span className="font-medium text-gray-900">{unit.name}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <SourceBadge sourceType={unit.source_type} size="sm" />
-              <span className="text-xs text-gray-500 capitalize">{unit.type}</span>
-            </div>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function UnitDetail({ unit }: { unit: UnitInsight }) {
-  const adoptionDim = unit.dimensions.find((d) => d.dimension_type === 'adoption');
-  const expectationDim = unit.dimensions.find((d) => d.dimension_type === 'expectation');
-  const progressDim = unit.dimensions.find((d) => d.dimension_type === 'progress');
-
-  return (
-    <div>
-      {/* Type badge */}
-      <div className="flex items-center gap-2 mb-3">
-        {unit.type === 'trend' ? (
-          <span className="badge badge-info">
-            <TrendingUp className="w-3 h-3 mr-1" />
-            Trend
-          </span>
+          </>
         ) : (
-          <span className="badge badge-warning">
-            <AlertCircle className="w-3 h-3 mr-1" />
-            Health Stake
-          </span>
+          <div className="flex items-center justify-center h-full p-8 overflow-auto">
+            {isLoadingViz ? (
+              <LoadingState message="Loading visualization data..." />
+            ) : !vizData ? (
+              <EmptyState
+                icon={BarChart3}
+                title="No visualization data"
+                description="Unable to load visualization data."
+              />
+            ) : viewMode === 'trends' && vizData.trends.length === 0 ? (
+              <EmptyState
+                icon={TrendingUp}
+                title="No trend data"
+                description="No trends with dimension assessments found."
+              />
+            ) : viewMode === 'stakes' && vizData.stakes.length === 0 ? (
+              <EmptyState
+                icon={AlertCircle}
+                title="No stake data"
+                description="No health stakes with dimension assessments found."
+              />
+            ) : (
+              <div className="w-full max-w-6xl">
+                <div className="bg-white rounded-lg shadow-lg p-6">
+                  <h2 className="text-2xl font-bold mb-4">
+                    {viewMode === 'trends' ? 'Trends Analysis' : 'Health Stakes Analysis'}
+                  </h2>
+                  <p className="text-gray-600 mb-6">
+                    {viewMode === 'trends'
+                      ? 'Visualizing trends by expectation level and progress horizon, colored by adoption stage.'
+                      : 'Visualizing health stakes by criticality and urgency, colored by actionability level.'}
+                  </p>
+                  <ScatterPlotVisualization
+                    data={viewMode === 'trends' ? vizData.trends : vizData.stakes}
+                    type={viewMode === 'trends' ? 'trend' : 'stake'}
+                    width={1000}
+                    height={700}
+                    onPointClick={(id) => setSelection({ type: 'unit', id })}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
         )}
-        <SourceBadge sourceType={unit.source_type} />
+
+        {/* Detail Panel */}
+        <DetailPanel
+          selection={selection}
+          cluster={selectedCluster}
+          macro={selectedMacro}
+          unit={selectedUnit}
+          onClose={handleClosePanel}
+          onSelectMacro={(id) => setSelection({ type: 'macro', id })}
+          onSelectUnit={(id) => setSelection({ type: 'unit', id })}
+          onOpenVideo={handleOpenVideo}
+          onOpenPdf={handleOpenPdf}
+        />
+
+        {/* Video Modal */}
+        <VideoModal
+          open={videoModal.open}
+          url={videoModal.url}
+          start={videoModal.start}
+          end={videoModal.end}
+          title={videoModal.title}
+          subtitle={videoModal.subtitle}
+          onClose={handleCloseVideo}
+        />
+
+        {/* PDF Modal */}
+        <PdfModal
+          open={pdfModal.open}
+          page={pdfModal.page}
+          path={pdfModal.path}
+          onClose={handleClosePdf}
+        />
       </div>
-
-      <h3 className="text-xl font-semibold text-gray-900 mb-2">{unit.name}</h3>
-      <p className="text-gray-600 mb-6">{unit.description}</p>
-
-      {/* Dimensions */}
-      {unit.dimensions.length > 0 && (
-        <div className="space-y-6">
-          {adoptionDim && (
-            <DimensionCard
-              title="Adoption Level"
-              dimension={adoptionDim}
-              badge={<AdoptionBadge level={adoptionDim.value} />}
-            />
-          )}
-
-          {expectationDim && (
-            <DimensionCard
-              title="Market Expectation"
-              dimension={expectationDim}
-              badge={
-                <span className={clsx(
-                  'badge',
-                  expectationDim.value === 'High' && 'badge-success',
-                  expectationDim.value === 'Moderate' && 'badge-warning',
-                  expectationDim.value === 'Low' && 'badge-danger'
-                )}>
-                  {expectationDim.value}
-                </span>
-              }
-            />
-          )}
-
-          {progressDim && (
-            <DimensionCard
-              title="Progress Horizon"
-              dimension={progressDim}
-              badge={
-                <span className="badge badge-info">
-                  <Clock className="w-3 h-3 mr-1" />
-                  {progressDim.value}
-                </span>
-              }
-            />
-          )}
-        </div>
-      )}
     </div>
   );
 }
 
-function DimensionCard({
-  title,
-  dimension,
-  badge,
-}: {
-  title: string;
-  dimension: Dimension;
-  badge: React.ReactNode;
-}) {
+// ============================================
+// Network Legend Component
+// ============================================
+
+function NetworkLegend() {
   return (
-    <div className="bg-gray-50 rounded-lg p-4">
-      <div className="flex items-center justify-between mb-3">
-        <h4 className="font-medium text-gray-900">{title}</h4>
-        {badge}
+    <div className="network-legend">
+      <h3>Insight Types</h3>
+      <div className="network-legend-item">
+        <div className="network-legend-color" style={{ background: TYPE_COLORS.trend }} />
+        <div className="network-legend-text"><strong>Trend</strong></div>
       </div>
-
-      {dimension.confidence !== undefined && (
-        <div className="mb-3">
-          <div className="flex items-center justify-between text-sm mb-1">
-            <span className="text-gray-500">Confidence</span>
-            <span className="font-medium">{Math.round(dimension.confidence * 100)}%</span>
+      <div className="network-legend-item">
+        <div className="network-legend-color" style={{ background: TYPE_COLORS.health_stake }} />
+        <div className="network-legend-text"><strong>Health Stake</strong></div>
+      </div>
+      <div className="mt-4">
+        <h3>Adoption Stages</h3>
+        {Object.entries(STAGE_COLORS).map(([stage, color]) => (
+          <div key={stage} className="network-legend-item">
+            <div className="network-legend-color" style={{ background: color }} />
+            <div className="network-legend-text text-xs">{stage}</div>
           </div>
-          <div className="h-1.5 bg-gray-200 rounded-full overflow-hidden">
-            <div
-              className="h-full bg-savencia-primary rounded-full"
-              style={{ width: `${dimension.confidence * 100}%` }}
-            />
-          </div>
-        </div>
-      )}
-
-      {dimension.evidence.length > 0 && (
-        <div>
-          <h5 className="text-sm font-medium text-gray-700 mb-2">Supporting Evidence</h5>
-          <div className="space-y-2">
-            {dimension.evidence.slice(0, 3).map((text, i) => (
-              <div
-                key={i}
-                className="p-3 bg-white rounded border border-gray-200 text-sm text-gray-600"
-              >
-                <p className="line-clamp-3">"{text}"</p>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+        ))}
+      </div>
     </div>
   );
 }
