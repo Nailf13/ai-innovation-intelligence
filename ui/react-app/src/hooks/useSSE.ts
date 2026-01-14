@@ -32,7 +32,7 @@ export interface UseSSEOptions {
  */
 export function useSSE({ url, onMessage, onError, onOpen, enabled = true }: UseSSEOptions) {
   const eventSourceRef = useRef<EventSource | null>(null);
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const maxReconnectAttempts = 5;
   const baseReconnectDelay = 1000; // 1 second

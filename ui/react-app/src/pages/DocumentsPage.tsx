@@ -215,9 +215,10 @@ export function DocumentsPage() {
       queryKey: ['document', documentId, 'status'],
       queryFn: () => documentsApi.getDocumentProcessingStatus(documentId),
       enabled: !isOptimisticId, // Don't query for optimistic IDs
-      refetchInterval: (data) => {
+      refetchInterval: (query) => {
         // Poll more frequently if processing
-        if (data?.status === 'processing' || data?.status === 'uploading') return 3000;
+        const status = query.state.data?.status;
+        if (status === 'processing' || status === 'uploading') return 3000;
         // Otherwise poll less frequently
         return 10000;
       },

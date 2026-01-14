@@ -6,18 +6,18 @@ export interface TrendVisualizationPoint {
   id: number;
   name: string;
   description: string;
-  expectation: string;
-  progress: string;
-  adoption: string;
+  expectation?: string | null;
+  progress?: string | null;
+  adoption?: string | null;
 }
 
 export interface StakeVisualizationPoint {
   id: number;
   name: string;
   description: string;
-  criticality: string;
-  urgency: string;
-  actionability: string;
+  criticality?: string | null;
+  urgency?: string | null;
+  actionability?: string | null;
 }
 
 interface ScatterPlotProps {
