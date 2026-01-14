@@ -25,6 +25,9 @@ dependencies = [
   "uvicorn[standard]",
   "python-multipart",
   "httpx",
+  "google-cloud-storage",
+  "google-cloud-aiplatform",
+  "google-cloud-speech",
 ]
 
 [project.optional-dependencies]

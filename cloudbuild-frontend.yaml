@@ -1,0 +1,81 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        docker pull europe-west1-docker.pkg.dev/$PROJECT_ID/innovation-intelligence/frontend:latest || exit 0
+    id: 'pull-cache'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    env:
+      - 'DOCKER_BUILDKIT=1'
+    args:
+      - 'build'
+      - '--cache-from=europe-west1-docker.pkg.dev/$PROJECT_ID/innovation-intelligence/frontend:latest'
+      - '--build-arg'
+      - 'VITE_API_URL=${_BACKEND_URL}'
+      - '--build-arg'
+      - 'VITE_CLERK_PUBLISHABLE_KEY=${_CLERK_KEY}'
+      - '-t'
+      - 'europe-west1-docker.pkg.dev/$PROJECT_ID/innovation-intelligence/frontend:$SHORT_SHA'
+      - '-t'
+      - 'europe-west1-docker.pkg.dev/$PROJECT_ID/innovation-intelligence/frontend:latest'
+      - '--platform=linux/amd64'
+      - '-f'
+      - 'frontend/Dockerfile'
+      - '.'
+    id: 'build-image'
+    waitFor: ['pull-cache']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'europe-west1-docker.pkg.dev/$PROJECT_ID/innovation-intelligence/frontend'
+    id: 'push-image'
+    waitFor: ['build-image']
+
+  - name: 'gcr.io/cloud-builders/kubectl'
+    args:
+      - 'rollout'
+      - 'restart'
+      - 'deployment/frontend-react'
+      - '-n'
+      - 'innovation-intelligence'
+    env:
+      - 'CLOUDSDK_CORE_PROJECT=prj-digital-financial-analysis'
+      - 'CLOUDSDK_COMPUTE_REGION=europe-west1'
+      - 'CLOUDSDK_CONTAINER_CLUSTER=analyse-concurrence-cluster'
+    id: 'deploy-gke'
+    waitFor: ['push-image']
+
+  - name: 'gcr.io/cloud-builders/kubectl'
+    args:
+      - 'rollout'
+      - 'status'
+      - 'deployment/frontend-react'
+      - '-n'
+      - 'innovation-intelligence'
+      - '--timeout=5m'
+    env:
+      - 'CLOUDSDK_CORE_PROJECT=prj-digital-financial-analysis'
+      - 'CLOUDSDK_COMPUTE_REGION=europe-west1'
+      - 'CLOUDSDK_CONTAINER_CLUSTER=analyse-concurrence-cluster'
+    id: 'wait-rollout'
+    waitFor: ['deploy-gke']
+
+images:
+  - 'europe-west1-docker.pkg.dev/$PROJECT_ID/innovation-intelligence/frontend:$SHORT_SHA'
+  - 'europe-west1-docker.pkg.dev/$PROJECT_ID/innovation-intelligence/frontend:latest'
+
+timeout: '900s'
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+  diskSizeGb: 50
+  logging: CLOUD_LOGGING_ONLY
+
+substitutions:
+  _BACKEND_URL: 'http://api.34.8.85.230.nip.io'
+  _CLERK_KEY: 'pk_test_Y2VudHJhbC1iYXQtNjMuY2xlcmsuYWNjb3VudHMuZGV2JA'

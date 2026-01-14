@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-fastapi
+  namespace: innovation-intelligence
+  labels:
+    app: backend
+    component: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+      component: api
+  template:
+    metadata:
+      labels:
+        app: backend
+        component: api
+    spec:
+      serviceAccountName: innovation-intelligence-sa
+      containers:
+      - name: fastapi
+        image: europe-west1-docker.pkg.dev/prj-digital-financial-analysis/innovation-intelligence/backend:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: innovation-secrets
+              key: database-url
+        - name: GOOGLE_CLOUD_PROJECT
+          value: "prj-digital-financial-analysis"
+        - name: GOOGLE_CLOUD_REGION
+          value: "europe-west1"
+        - name: GOOGLE_GENAI_USE_VERTEXAI
+          value: "true"
+        - name: GCS_BUCKET
+          value: "bucket-innovation-intelligence-demo"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: innovation-secrets
+              key: hf-token
+        - name: PODCAST_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: innovation-secrets
+              key: podcast-api-key
+        - name: PODCAST_API_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: innovation-secrets
+              key: podcast-api-secret
+        - name: CORS_ORIGINS
+          value: "http://localhost:3000,http://localhost:5173,http://app.34.8.85.230.nip.io,http://api.34.8.85.230.nip.io"
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "8Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6

@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  namespace: innovation-intelligence
+  labels:
+    app: backend
+  annotations:
+    cloud.google.com/backend-config: '{"default": "innovation-backend-config"}'
+spec:
+  type: ClusterIP
+  selector:
+    app: backend
+    component: api
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000
+    protocol: TCP

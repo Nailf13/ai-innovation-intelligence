@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: innovation-intelligence
+  labels:
+    app: innovation-intelligence
+    project: ai-innovation-intelligence

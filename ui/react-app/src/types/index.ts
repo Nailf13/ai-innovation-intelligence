@@ -34,6 +34,8 @@ export interface PodcastEpisode {
   audio_url?: string;
   gcs_audio_uri?: string;
   gcs_transcript_uri?: string;
+  audio_path?: string;
+  transcript_path?: string;
   episode_date?: string;
   created_at: string;
 }
@@ -63,6 +65,7 @@ export interface Document {
   source_type?: string;
   gcs_document_uri?: string;
   gcs_transcript_uri?: string;
+  transcript_path?: string;
   document_date?: string;
   created_at: string;
 }
