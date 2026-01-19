@@ -108,7 +108,7 @@ interface DetailPanelProps {
   onSelectMacro: (id: number) => void;
   onSelectUnit: (id: number) => void;
   onOpenVideo: (url: string, start: number, end?: number, title?: string, subtitle?: string) => void;
-  onOpenPdf: (page: number, path?: string) => void;
+  onOpenPdf: (url: string, page: number, title: string) => void;
 }
 
 export function DetailPanel({
@@ -436,7 +436,7 @@ function UnitDetail({
 }: {
   unit: UnitInsight;
   onOpenVideo: (url: string, start: number, end?: number, title?: string, subtitle?: string) => void;
-  onOpenPdf: (page: number, path?: string) => void;
+  onOpenPdf: (url: string, page: number, title: string) => void;
 }) {
   // State for audio player modal - keep audio loaded once opened
   const [audioPlayerState, setAudioPlayerState] = useState<{

@@ -659,7 +659,7 @@ export function ScatterPlotVisualization({
           style={{
             left: tooltip.x + 15,
             top: tooltip.y - 10,
-            transform: tooltip.x > width - 250 ? 'translateX(-110%)' : 'none',
+            transform: tooltip.x > (width ?? 800) - 250 ? 'translateX(-110%)' : 'none',
           }}
         >
           <div className="bg-white/95 backdrop-blur-sm rounded-xl shadow-2xl border border-slate-200/80 p-4 max-w-[280px]">

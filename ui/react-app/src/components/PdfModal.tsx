@@ -105,6 +105,7 @@ export function PdfModal({ open, pdfUrl, initialPage = 1, title, onClose }: PdfM
       const renderContext = {
         canvasContext: context,
         viewport: viewport,
+        canvas: canvas,
       };
 
       await page.render(renderContext).promise;
