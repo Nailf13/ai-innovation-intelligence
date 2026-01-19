@@ -18,6 +18,7 @@ import {
   AlertCircle,
   BarChart3,
   Network,
+  RefreshCw,
 } from 'lucide-react';
 import clsx from 'clsx';
 
@@ -67,15 +68,23 @@ export function InsightsPage() {
   }>({ open: false });
   const [pdfModal, setPdfModal] = useState<{
     open: boolean;
-    page?: number;
-    path?: string;
+    pdfUrl?: string;
+    initialPage?: number;
+    title?: string;
   }>({ open: false });
 
   // Fetch hierarchy
-  const { data: hierarchy, isLoading } = useQuery({
+  const { data: hierarchy, isLoading, refetch: refetchHierarchy } = useQuery({
     queryKey: ['insights', 'hierarchy'],
     queryFn: insightsApi.getHierarchy,
   });
+
+  // Function to clear sparkles from localStorage
+  const clearSparkles = useCallback(() => {
+    console.log('🧹 Clearing all sparkles from localStorage');
+    localStorage.removeItem('network-viz-sparkles');
+    localStorage.removeItem('network-viz-previous-ids');
+  }, []);
 
   // Fetch visualization data
   const { data: vizData, isLoading: isLoadingViz } = useQuery({
@@ -104,6 +113,7 @@ export function InsightsPage() {
   });
 
   const handleNodeClick = useCallback((type: SelectionType, id: number) => {
+    console.log(`🎯 Node clicked: type=${type}, id=${id}`);
     setSelection({ type, id });
   }, []);
 
@@ -119,13 +129,18 @@ export function InsightsPage() {
     setVideoModal({ open: false });
   }, []);
 
-  const handleOpenPdf = useCallback((page: number, path?: string) => {
-    setPdfModal({ open: true, page, path });
+  const handleOpenPdf = useCallback((url: string, page: number, title: string) => {
+    setPdfModal({ open: true, pdfUrl: url, initialPage: page, title });
   }, []);
 
   const handleClosePdf = useCallback(() => {
     setPdfModal({ open: false });
   }, []);
+
+  // Log selection changes
+  useEffect(() => {
+    console.log('📍 Selection changed:', selection);
+  }, [selection]);
 
   // Keyboard shortcut for closing modals
   useEffect(() => {
@@ -148,43 +163,45 @@ export function InsightsPage() {
 
       {/* View Mode Toggle */}
       <div className="px-6 py-3 bg-white border-b border-gray-200">
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setViewMode('network')}
-            className={clsx(
-              'flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors',
-              viewMode === 'network'
-                ? 'bg-blue-100 text-blue-700'
-                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-            )}
-          >
-            <Network className="w-4 h-4" />
-            Network View
-          </button>
-          <button
-            onClick={() => setViewMode('trends')}
-            className={clsx(
-              'flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors',
-              viewMode === 'trends'
-                ? 'bg-blue-100 text-blue-700'
-                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-            )}
-          >
-            <BarChart3 className="w-4 h-4" />
-            Trends View
-          </button>
-          <button
-            onClick={() => setViewMode('stakes')}
-            className={clsx(
-              'flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors',
-              viewMode === 'stakes'
-                ? 'bg-blue-100 text-blue-700'
-                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-            )}
-          >
-            <AlertCircle className="w-4 h-4" />
-            Stakes View
-          </button>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setViewMode('network')}
+              className={clsx(
+                'flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors',
+                viewMode === 'network'
+                  ? 'bg-blue-100 text-blue-700'
+                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+              )}
+            >
+              <Network className="w-4 h-4" />
+              Network View
+            </button>
+            <button
+              onClick={() => setViewMode('trends')}
+              className={clsx(
+                'flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors',
+                viewMode === 'trends'
+                  ? 'bg-blue-100 text-blue-700'
+                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+              )}
+            >
+              <BarChart3 className="w-4 h-4" />
+              Trends View
+            </button>
+            <button
+              onClick={() => setViewMode('stakes')}
+              className={clsx(
+                'flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors',
+                viewMode === 'stakes'
+                  ? 'bg-blue-100 text-blue-700'
+                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+              )}
+            >
+              <AlertCircle className="w-4 h-4" />
+              Stakes View
+            </button>
+          </div>
         </div>
       </div>
 
@@ -211,9 +228,6 @@ export function InsightsPage() {
               />
             )}
 
-            {/* Floating Legend */}
-            <NetworkLegend />
-
             {/* Controls Hint */}
             <div className="network-controls">
               <strong>Controls:</strong>
@@ -221,43 +235,52 @@ export function InsightsPage() {
             </div>
           </>
         ) : (
-          <div className="flex items-center justify-center h-full p-8 overflow-auto">
+          <div className="h-full overflow-hidden">
             {isLoadingViz ? (
-              <LoadingState message="Loading visualization data..." />
+              <div className="flex items-center justify-center h-full">
+                <LoadingState message="Loading visualization data..." />
+              </div>
             ) : !vizData ? (
-              <EmptyState
-                icon={BarChart3}
-                title="No visualization data"
-                description="Unable to load visualization data."
-              />
+              <div className="flex items-center justify-center h-full">
+                <EmptyState
+                  icon={BarChart3}
+                  title="No visualization data"
+                  description="Unable to load visualization data."
+                />
+              </div>
             ) : viewMode === 'trends' && vizData.trends.length === 0 ? (
-              <EmptyState
-                icon={TrendingUp}
-                title="No trend data"
-                description="No trends with dimension assessments found."
-              />
+              <div className="flex items-center justify-center h-full">
+                <EmptyState
+                  icon={TrendingUp}
+                  title="No trend data"
+                  description="No trends with dimension assessments found."
+                />
+              </div>
             ) : viewMode === 'stakes' && vizData.stakes.length === 0 ? (
-              <EmptyState
-                icon={AlertCircle}
-                title="No stake data"
-                description="No health stakes with dimension assessments found."
-              />
+              <div className="flex items-center justify-center h-full">
+                <EmptyState
+                  icon={AlertCircle}
+                  title="No stake data"
+                  description="No health stakes with dimension assessments found."
+                />
+              </div>
             ) : (
-              <div className="w-full max-w-6xl">
-                <div className="bg-white rounded-lg shadow-lg p-6">
-                  <h2 className="text-2xl font-bold mb-4">
+              <div className="w-full h-full flex flex-col p-6 gap-4">
+                <div>
+                  <h2 className="text-2xl font-bold">
                     {viewMode === 'trends' ? 'Trends Analysis' : 'Health Stakes Analysis'}
                   </h2>
-                  <p className="text-gray-600 mb-6">
+                  <p className="text-gray-600 text-sm mt-1">
                     {viewMode === 'trends'
                       ? 'Visualizing trends by expectation level and progress horizon, colored by adoption stage.'
                       : 'Visualizing health stakes by criticality and urgency, colored by actionability level.'}
                   </p>
+                </div>
+                <div className="flex-1 min-h-0">
                   <ScatterPlotVisualization
                     data={viewMode === 'trends' ? vizData.trends : vizData.stakes}
                     type={viewMode === 'trends' ? 'trend' : 'stake'}
-                    width={1000}
-                    height={700}
+                    selectedId={selection?.type === 'unit' ? selection.id : null}
                     onPointClick={(id) => setSelection({ type: 'unit', id })}
                   />
                 </div>
@@ -293,8 +316,9 @@ export function InsightsPage() {
         {/* PDF Modal */}
         <PdfModal
           open={pdfModal.open}
-          page={pdfModal.page}
-          path={pdfModal.path}
+          pdfUrl={pdfModal.pdfUrl || null}
+          initialPage={pdfModal.initialPage}
+          title={pdfModal.title}
           onClose={handleClosePdf}
         />
       </div>
@@ -302,31 +326,3 @@ export function InsightsPage() {
   );
 }
 
-// ============================================
-// Network Legend Component
-// ============================================
-
-function NetworkLegend() {
-  return (
-    <div className="network-legend">
-      <h3>Insight Types</h3>
-      <div className="network-legend-item">
-        <div className="network-legend-color" style={{ background: TYPE_COLORS.trend }} />
-        <div className="network-legend-text"><strong>Trend</strong></div>
-      </div>
-      <div className="network-legend-item">
-        <div className="network-legend-color" style={{ background: TYPE_COLORS.health_stake }} />
-        <div className="network-legend-text"><strong>Health Stake</strong></div>
-      </div>
-      <div className="mt-4">
-        <h3>Adoption Stages</h3>
-        {Object.entries(STAGE_COLORS).map(([stage, color]) => (
-          <div key={stage} className="network-legend-item">
-            <div className="network-legend-color" style={{ background: color }} />
-            <div className="network-legend-text text-xs">{stage}</div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}

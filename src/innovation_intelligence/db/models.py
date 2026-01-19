@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
@@ -12,6 +13,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    Enum as SQLEnum,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB
@@ -21,6 +23,39 @@ from innovation_intelligence.db.base import Base
 
 # BGE-M3 produces 1024-dimensional embeddings
 EMBEDDING_DIM = 1024
+
+
+class EpisodeStatus(str, Enum):
+    """
+    Podcast episode processing status lifecycle.
+
+    Lifecycle: needs_processing → downloading → transcribing →
+               indexing → ready → analyzing → analyzed
+    """
+    NEEDS_PROCESSING = "needs_processing"
+    DOWNLOADING = "downloading"
+    TRANSCRIBING = "transcribing"
+    INDEXING = "indexing"
+    READY = "ready"
+    ANALYZING = "analyzing"
+    ANALYZED = "analyzed"
+    FAILED = "failed"
+
+
+class DocumentStatus(str, Enum):
+    """
+    Document processing status lifecycle.
+
+    Lifecycle: needs_processing → uploading → indexing →
+               ready → analyzing → analyzed
+    """
+    NEEDS_PROCESSING = "needs_processing"
+    UPLOADING = "uploading"
+    INDEXING = "indexing"
+    READY = "ready"
+    ANALYZING = "analyzing"
+    ANALYZED = "analyzed"
+    FAILED = "failed"
 
 
 class PodcastEpisode(Base):
@@ -40,6 +75,14 @@ class PodcastEpisode(Base):
     # GCS storage URIs (primary storage)
     gcs_audio_uri = Column(String(1024), nullable=False)
     gcs_transcript_uri = Column(String(1024), nullable=True)
+
+    # Processing status
+    status = Column(
+        SQLEnum(EpisodeStatus, values_callable=lambda obj: [e.value for e in obj]),
+        nullable=False,
+        default=EpisodeStatus.NEEDS_PROCESSING,
+        index=True,
+    )
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -74,6 +117,14 @@ class Document(Base):
     # GCS storage URIs (primary storage)
     gcs_document_uri = Column(String(1024), nullable=False)
     gcs_transcript_uri = Column(String(1024), nullable=True)
+
+    # Processing status
+    status = Column(
+        SQLEnum(DocumentStatus, values_callable=lambda obj: [e.value for e in obj]),
+        nullable=False,
+        default=DocumentStatus.NEEDS_PROCESSING,
+        index=True,
+    )
 
     created_at = Column(DateTime, default=datetime.utcnow)
 

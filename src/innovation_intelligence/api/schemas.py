@@ -97,6 +97,7 @@ class PodcastEpisodeDB(BaseModel):
     audio_url: Optional[str] = None
     gcs_transcript_uri: Optional[str] = None
     episode_date: Optional[datetime] = None
+    status: Optional[str] = "needs_processing"  # Episode processing status
     created_at: datetime
 
     class Config:
@@ -122,6 +123,7 @@ class DocumentDB(BaseModel):
     gcs_document_uri: str
     gcs_transcript_uri: Optional[str] = None
     document_date: Optional[datetime] = None
+    status: Optional[str] = "needs_processing"  # Document processing status
     created_at: datetime
 
     class Config:
@@ -259,6 +261,9 @@ class EvidenceItem(BaseModel):
     text: str
     source_ref: Optional[str] = None
     similarity_score: Optional[float] = None
+    # Source identification (episode_id or document_id)
+    source_id: Optional[int] = None
+    source_type: Optional[str] = None  # 'podcast' or 'document'
     # Podcast-specific metadata
     start_time: Optional[float] = None
     end_time: Optional[float] = None
@@ -309,6 +314,7 @@ class ClusterResponse(BaseModel):
     description: Optional[str] = None
     macro_insight_count: int = 0
     macro_insights: Optional[List["MacroInsightResponse"]] = None
+    orphan_unit_insights: Optional[List["UnitInsightResponse"]] = None
 
     class Config:
         from_attributes = True

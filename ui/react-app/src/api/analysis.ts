@@ -27,7 +27,7 @@ export const analysisApi = {
       skip_extraction: options?.skipExtraction ?? false,
       clustering_only: options?.clusteringOnly ?? false,
       force_reextract: options?.forceReextract ?? false,
-      macro_similarity_threshold: options?.macroSimilarityThreshold ?? 0.70,
+      macro_similarity_threshold: options?.macroSimilarityThreshold ?? 0.75,
       cluster_similarity_threshold: options?.clusterSimilarityThreshold ?? 0.5,
       use_llm_naming: options?.useLlmNaming ?? true,
       generate_macro_descriptions: options?.generateMacroDescriptions ?? false,

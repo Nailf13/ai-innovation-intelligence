@@ -1,9 +1,10 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Header } from '../components/layout';
 import { LoadingState, EmptyState } from '../components/common';
-import { podcastsApi, analysisApi, ingestionApi } from '../api';
+import { podcastsApi, analysisApi } from '../api';
 import { PodcastEpisode, PodcastSearchResult, PodcastEpisodeInfo } from '../types';
+import { useSSE } from '../hooks/useSSE';
 import {
   Search,
   Mic,
@@ -17,6 +18,7 @@ import {
   Clock,
   Loader2,
   ChevronDown,
+  Trash2,
 } from 'lucide-react';
 import { format } from 'date-fns';
 import clsx from 'clsx';
@@ -33,18 +35,45 @@ export function PodcastsPage() {
   const [hasMoreEpisodes, setHasMoreEpisodes] = useState(false);
   const [nextOffset, setNextOffset] = useState<number | undefined>(undefined);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [downloadingIds, setDownloadingIds] = useState<Set<number>>(new Set());
-  const [transcribingIds, setTranscribingIds] = useState<Set<number>>(new Set());
-  const pollingIntervals = useRef<Map<number, ReturnType<typeof setInterval>>>(new Map());
-  const transcriptionPolling = useRef<Map<number, ReturnType<typeof setInterval>>>(new Map());
+  // Track episode statuses locally for real-time updates
+  const [episodeStatuses, setEpisodeStatuses] = useState<Map<number, string>>(new Map());
 
-  // Cleanup polling intervals on unmount
-  useEffect(() => {
-    return () => {
-      pollingIntervals.current.forEach((interval) => clearInterval(interval));
-      transcriptionPolling.current.forEach((interval) => clearInterval(interval));
-    };
-  }, []);
+  // SSE connection for real-time episode status updates
+  useSSE({
+    url: `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'}/podcasts/events`,
+    enabled: true,
+    onMessage: (event) => {
+      console.log('SSE event received:', event);
+
+      if (event.type === 'episode_status') {
+        const { episode_id, status } = event;
+
+        // Update local status map
+        setEpisodeStatuses((prev) => {
+          const next = new Map(prev);
+          next.set(episode_id, status);
+          return next;
+        });
+
+        // Refresh the podcasts list when status changes
+        queryClient.invalidateQueries({ queryKey: ['podcasts', 'saved'] });
+      }
+
+      if (event.type === 'analysis_status') {
+        // Refresh on analysis completion
+        if (event.status === 'completed' || event.status === 'failed') {
+          queryClient.invalidateQueries({ queryKey: ['podcasts', 'saved'] });
+          queryClient.invalidateQueries({ queryKey: ['analysis', 'tasks'] });
+        }
+      }
+    },
+    onError: (error) => {
+      console.error('SSE connection error:', error);
+    },
+    onOpen: () => {
+      console.log('SSE connection established');
+    },
+  });
 
   // Fetch saved podcasts
   const { data: savedPodcasts = [], isLoading: loadingSaved } = useQuery({
@@ -97,127 +126,65 @@ export function PodcastsPage() {
     },
   });
 
-  // Start polling for download completion
-  const startDownloadPolling = (episodeId: number) => {
-    // Clear any existing interval for this episode
-    const existing = pollingIntervals.current.get(episodeId);
-    if (existing) clearInterval(existing);
+  // Delete episode mutation
+  const deleteMutation = useMutation({
+    mutationFn: (episodeId: number) => podcastsApi.deleteEpisode(episodeId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['podcasts', 'saved'] });
+    },
+  });
 
-    const interval = setInterval(async () => {
-      try {
-        const episode = await podcastsApi.getEpisode(episodeId);
-        if (episode.audio_path) {
-          // Download complete, stop polling and update UI
-          clearInterval(interval);
-          pollingIntervals.current.delete(episodeId);
-          setDownloadingIds((prev) => {
-            const next = new Set(prev);
-            next.delete(episodeId);
-            return next;
-          });
-          // Refresh the podcasts list to show updated status
-          queryClient.invalidateQueries({ queryKey: ['podcasts', 'saved'] });
-        }
-      } catch (error) {
-        console.error('Error polling episode status:', error);
-      }
-    }, 2000); // Poll every 2 seconds
-
-    pollingIntervals.current.set(episodeId, interval);
-
-    // Stop polling after 5 minutes to avoid infinite polling
-    setTimeout(() => {
-      const int = pollingIntervals.current.get(episodeId);
-      if (int) {
-        clearInterval(int);
-        pollingIntervals.current.delete(episodeId);
-        setDownloadingIds((prev) => {
-          const next = new Set(prev);
-          next.delete(episodeId);
-          return next;
-        });
-      }
-    }, 5 * 60 * 1000);
-  };
-
-  // Download audio handler
-  const handleDownload = async (episodeId: number) => {
-    setDownloadingIds((prev) => new Set(prev).add(episodeId));
+  // Process episode handler (starts download, transcription, and indexing)
+  const handleProcess = async (episodeId: number) => {
     try {
-      await podcastsApi.downloadAudio(episodeId);
-      // Start polling for completion
-      startDownloadPolling(episodeId);
+      // The processing endpoint handles download, transcription, and indexing
+      // SSE will provide real-time status updates
+      await podcastsApi.processPodcast(episodeId);
     } catch (error) {
-      console.error('Error starting download:', error);
-      setDownloadingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(episodeId);
-        return next;
-      });
+      console.error('Error starting processing:', error);
     }
   };
 
-  // Start polling for transcription completion
-  const startTranscriptionPolling = (episodeId: number, taskId: string) => {
-    // Clear any existing interval for this episode
-    const existing = transcriptionPolling.current.get(episodeId);
-    if (existing) clearInterval(existing);
-
-    const interval = setInterval(async () => {
-      try {
-        const status = await ingestionApi.getStatus(taskId);
-        if (status.status === 'completed' || status.status === 'failed') {
-          // Transcription finished, stop polling and update UI
-          clearInterval(interval);
-          transcriptionPolling.current.delete(episodeId);
-          setTranscribingIds((prev) => {
-            const next = new Set(prev);
-            next.delete(episodeId);
-            return next;
-          });
-          // Refresh the podcasts list to show updated status
-          queryClient.invalidateQueries({ queryKey: ['podcasts', 'saved'] });
-        }
-      } catch (error) {
-        console.error('Error polling transcription status:', error);
-      }
-    }, 3000); // Poll every 3 seconds
-
-    transcriptionPolling.current.set(episodeId, interval);
-
-    // Stop polling after 30 minutes (transcription can take a while)
-    setTimeout(() => {
-      const int = transcriptionPolling.current.get(episodeId);
-      if (int) {
-        clearInterval(int);
-        transcriptionPolling.current.delete(episodeId);
-        setTranscribingIds((prev) => {
-          const next = new Set(prev);
-          next.delete(episodeId);
-          return next;
-        });
-      }
-    }, 30 * 60 * 1000);
-  };
-
-  // Transcribe audio handler
-  const handleTranscribe = async (episodeId: number) => {
-    setTranscribingIds((prev) => new Set(prev).add(episodeId));
+  // Retry indexing handler (for failed episodes with transcripts)
+  const handleRetryIndexing = async (episodeId: number) => {
     try {
-      const task = await ingestionApi.transcribe(episodeId);
-      // Start polling for completion
-      startTranscriptionPolling(episodeId, task.task_id);
+      // Retry indexing only - transcript already exists
+      // SSE will provide real-time status updates
+      await podcastsApi.retryIndexing(episodeId);
     } catch (error) {
-      console.error('Error starting transcription:', error);
-      setTranscribingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(episodeId);
-        return next;
-      });
+      console.error('Error retrying indexing:', error);
+      alert('Failed to retry indexing. Please try again.');
     }
   };
 
-  const isTranscribing = (episodeId: number) => transcribingIds.has(episodeId);
+  // Delete episode handler
+  const handleDelete = async (episodeId: number, episodeTitle: string) => {
+    if (window.confirm(`Are you sure you want to delete "${episodeTitle}"? This will also delete all associated insights.`)) {
+      try {
+        await deleteMutation.mutateAsync(episodeId);
+      } catch (error) {
+        console.error('Error deleting episode:', error);
+        alert('Failed to delete episode. Please try again.');
+      }
+    }
+  };
+
+  // Get episode status from local map or episode data
+  const getEpisodeStatus = (episode: PodcastEpisode): string => {
+    // Check SSE-updated status first
+    const sseStatus = episodeStatuses.get(episode.id);
+    if (sseStatus) return sseStatus;
+
+    // Fallback to episode status field if available
+    if ('status' in episode) {
+      return (episode as any).status;
+    }
+
+    // Legacy fallback logic
+    if (episode.transcript_path) return 'ready';
+    if (episode.audio_path) return 'transcribing';
+    return 'needs_processing';
+  };
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
@@ -274,9 +241,65 @@ export function PodcastsPage() {
     }
   };
 
-  const hasTranscript = (podcast: PodcastEpisode) => !!podcast.gcs_transcript_uri;
-  const hasAudio = (podcast: PodcastEpisode) => !!podcast.gcs_audio_uri;
-  const isDownloading = (episodeId: number) => downloadingIds.has(episodeId);
+  // Status badge component
+  const StatusBadge = ({ status }: { status: string }) => {
+    const statusConfig: Record<string, { icon: any; label: string; color: string; spinning?: boolean }> = {
+      needs_processing: {
+        icon: Download,
+        label: 'Needs Processing',
+        color: 'text-gray-500',
+      },
+      downloading: {
+        icon: Loader2,
+        label: 'Downloading',
+        color: 'text-blue-500',
+        spinning: true,
+      },
+      transcribing: {
+        icon: Loader2,
+        label: 'Transcribing',
+        color: 'text-yellow-500',
+        spinning: true,
+      },
+      indexing: {
+        icon: Loader2,
+        label: 'Indexing',
+        color: 'text-orange-500',
+        spinning: true,
+      },
+      ready: {
+        icon: CheckCircle,
+        label: 'Ready for Analysis',
+        color: 'text-green-500',
+      },
+      analyzing: {
+        icon: Loader2,
+        label: 'Analyzing',
+        color: 'text-purple-500',
+        spinning: true,
+      },
+      analyzed: {
+        icon: CheckCircle,
+        label: 'Analyzed',
+        color: 'text-green-600',
+      },
+      failed: {
+        icon: X,
+        label: 'Failed',
+        color: 'text-red-500',
+      },
+    };
+
+    const config = statusConfig[status] || statusConfig.needs_processing;
+    const Icon = config.icon;
+
+    return (
+      <span className={clsx('flex items-center gap-1 text-sm', config.color)}>
+        <Icon className={clsx('w-4 h-4', config.spinning && 'animate-spin')} />
+        {config.label}
+      </span>
+    );
+  };
 
   return (
     <div className="h-full flex flex-col">
@@ -296,24 +319,6 @@ export function PodcastsPage() {
               <Plus className="w-4 h-4" />
               Add Podcasts
             </button>
-            <button
-              onClick={() => analysisMutation.mutate()}
-              disabled={analysisMutation.isPending || savedPodcasts.length === 0}
-              className="btn btn-secondary flex items-center gap-2"
-            >
-              <Play className="w-4 h-4" />
-              Run Analysis
-            </button>
-          </div>
-
-          {/* Filter */}
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
-            <input
-              type="text"
-              placeholder="Filter episodes..."
-              className="input pl-10 w-64"
-            />
           </div>
         </div>
 
@@ -364,63 +369,71 @@ export function PodcastsPage() {
                           {format(new Date(podcast.episode_date), 'MMM d, yyyy')}
                         </span>
                       )}
-                      <span className="flex items-center gap-1">
-                        {hasTranscript(podcast) ? (
-                          <>
-                            <CheckCircle className="w-4 h-4 text-green-500" />
-                            Transcribed
-                          </>
-                        ) : hasAudio(podcast) ? (
-                          <>
-                            <Clock className="w-4 h-4 text-yellow-500" />
-                            Pending transcription
-                          </>
-                        ) : (
-                          <>
-                            <Download className="w-4 h-4 text-gray-400" />
-                            Needs download
-                          </>
-                        )}
-                      </span>
+                      <StatusBadge status={getEpisodeStatus(podcast)} />
                     </div>
                   </div>
 
                   <div className="flex items-center gap-2">
-                    {!hasAudio(podcast) && podcast.audio_url && (
-                      <button
-                        onClick={() => handleDownload(podcast.id)}
-                        disabled={isDownloading(podcast.id)}
-                        className="btn btn-sm btn-secondary flex items-center gap-1"
-                      >
-                        {isDownloading(podcast.id) ? (
-                          <>
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            Downloading...
-                          </>
-                        ) : (
-                          <>
-                            <Download className="w-4 h-4" />
-                            Download
-                          </>
-                        )}
-                      </button>
-                    )}
-                    {hasAudio(podcast) && !hasTranscript(podcast) && (
-                      <button
-                        onClick={() => handleTranscribe(podcast.id)}
-                        disabled={isTranscribing(podcast.id)}
-                        className="btn btn-sm btn-primary flex items-center gap-1"
-                      >
-                        {isTranscribing(podcast.id) ? (
-                          <>
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            Transcribing...
-                          </>
-                        ) : (
-                          'Transcribe'
-                        )}
-                      </button>
-                    )}
+                    {(() => {
+                      const status = getEpisodeStatus(podcast);
+                      const isProcessing = ['downloading', 'transcribing', 'indexing', 'analyzing'].includes(status);
+                      const hasTranscript = !!podcast.gcs_transcript_uri;
+
+                      return (
+                        <>
+                          {/* Show "Process" button for episodes that need processing */}
+                          {status === 'needs_processing' && (
+                            <button
+                              onClick={() => handleProcess(podcast.id)}
+                              className="btn btn-sm btn-primary flex items-center gap-1"
+                            >
+                              <Play className="w-4 h-4" />
+                              Process
+                            </button>
+                          )}
+
+                          {/* Show "Retry Indexing" button for failed episodes with transcripts */}
+                          {status === 'failed' && hasTranscript && (
+                            <button
+                              onClick={() => handleRetryIndexing(podcast.id)}
+                              className="btn btn-sm btn-primary flex items-center gap-1"
+                            >
+                              <Play className="w-4 h-4" />
+                              Retry Indexing
+                            </button>
+                          )}
+
+                          {/* Show "Process" button for failed episodes without transcripts */}
+                          {status === 'failed' && !hasTranscript && (
+                            <button
+                              onClick={() => handleProcess(podcast.id)}
+                              className="btn btn-sm btn-primary flex items-center gap-1"
+                            >
+                              <Play className="w-4 h-4" />
+                              Retry Processing
+                            </button>
+                          )}
+
+                          {/* Show processing indicator */}
+                          {isProcessing && (
+                            <span className="text-sm text-gray-500 flex items-center gap-1">
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                              Processing...
+                            </span>
+                          )}
+
+                          {/* Delete button - always show */}
+                          <button
+                            onClick={() => handleDelete(podcast.id, podcast.episode_title)}
+                            disabled={isProcessing || deleteMutation.isPending}
+                            className="btn btn-sm btn-ghost text-red-600 hover:bg-red-50 disabled:opacity-50"
+                            title="Delete episode"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </>
+                      );
+                    })()}
                   </div>
                 </div>
               </div>
@@ -515,11 +528,20 @@ export function PodcastsPage() {
                               <p className="font-medium text-sm truncate">
                                 {ep.title}
                               </p>
-                              {ep.date_published && (
-                                <p className="text-xs text-gray-500">
-                                  {format(new Date(ep.date_published), 'MMM d, yyyy')}
-                                </p>
-                              )}
+                              <div className="flex items-center gap-3 mt-1">
+                                {ep.date_published && (
+                                  <span className="text-xs text-gray-500 flex items-center gap-1">
+                                    <Calendar className="w-3 h-3" />
+                                    {format(new Date(ep.date_published), 'MMM d, yyyy')}
+                                  </span>
+                                )}
+                                {ep.duration && (
+                                  <span className="text-xs text-gray-500 flex items-center gap-1">
+                                    <Clock className="w-3 h-3" />
+                                    {Math.floor(ep.duration / 60)}m
+                                  </span>
+                                )}
+                              </div>
                             </div>
                           </label>
                         ))}

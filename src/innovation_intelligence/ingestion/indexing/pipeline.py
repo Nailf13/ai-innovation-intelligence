@@ -129,6 +129,7 @@ class VectorIndexingPipeline:
         podcast_name: str,
         episode_title: str,
         episode_date: Optional[str] = None,
+        raise_on_error: bool = False,
     ) -> int:
         """
         Index a single podcast episode from GCS (GCS-first mode).
@@ -138,9 +139,13 @@ class VectorIndexingPipeline:
             podcast_name: Podcast name
             episode_title: Episode title
             episode_date: Episode publication date (optional)
+            raise_on_error: If True, raises exceptions instead of catching them
 
         Returns:
             Number of chunks indexed
+
+        Raises:
+            Exception: If raise_on_error=True and indexing fails
         """
         from innovation_intelligence.ingestion.gcs_service import GCSStorageService
         from innovation_intelligence.ingestion.podcasts.podcast_chunker import chunk_from_gcs
@@ -184,6 +189,11 @@ class VectorIndexingPipeline:
             error_msg = f"Failed to index {source}: {e}"
             log.error(f"[INDEX] {error_msg}")
             self.stats.errors.append(error_msg)
+
+            # Re-raise if requested (for pipeline failure detection)
+            if raise_on_error:
+                raise
+
             return 0
 
     def index_all_podcasts_from_db(self) -> int:

@@ -4,6 +4,7 @@ Sophisticated chunking for documents (PDFs, text files).
 Strategy:
 - Chunk by structural boundaries (headings, paragraphs)
 - Target chunk size: 300-900 tokens (~1200-3600 chars)
+- Always split at sentence boundaries (never break sentences in the middle)
 - Add semantic overlap for continuity
 - Preserve metadata: source, page number, section
 """
@@ -100,7 +101,8 @@ class DocumentChunker:
     1. Detect structural boundaries (headings, paragraphs)
     2. Group paragraphs into target-sized chunks
     3. Respect section boundaries where possible
-    4. Add overlap for semantic continuity
+    4. Always split at sentence boundaries (never break sentences)
+    5. Add overlap for semantic continuity
     """
 
     def __init__(
@@ -239,11 +241,13 @@ class DocumentChunker:
     ) -> List[str]:
         """
         Split a long text block at sentence boundaries.
+        Ensures complete sentences are never broken in the middle.
         """
         if len(text) <= self.max_chars:
             return [text]
 
-        # Split on sentence boundaries
+        # Split on sentence boundaries with better regex to handle more cases
+        # Matches periods, exclamation marks, question marks followed by space and capital letter
         sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
 
         chunks: List[str] = []
@@ -254,12 +258,15 @@ class DocumentChunker:
             if not sentence:
                 continue
 
-            if len(current) + len(sentence) > self.max_chars and current:
+            # If adding this sentence would exceed max AND we have content, save current chunk
+            if current and (len(current) + len(sentence) + 1) > self.max_chars:
                 chunks.append(current.strip())
                 current = sentence
             else:
+                # Add sentence to current chunk
                 current = f"{current} {sentence}".strip() if current else sentence
 
+        # Don't forget the last chunk
         if current:
             chunks.append(current.strip())
 

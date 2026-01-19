@@ -135,6 +135,9 @@ export interface EvidenceItem {
   text: string;
   source_ref?: string;
   similarity_score?: number;
+  // Source identification (episode_id or document_id)
+  source_id?: number;
+  source_type?: 'podcast' | 'document';
   // Podcast metadata
   start_time?: number;
   end_time?: number;
@@ -179,6 +182,7 @@ export interface Cluster {
   description?: string;
   macro_insight_count: number;
   macro_insights?: MacroInsight[];
+  orphan_unit_insights?: UnitInsight[];
 }
 
 export interface InsightHierarchy {
@@ -194,12 +198,14 @@ export interface InsightHierarchy {
         id: number;
         name: string;
         type: InsightType;
+        source_type: 'podcast' | 'document' | 'unknown';
       }>;
     }>;
     orphan_unit_insights: Array<{
       id: number;
       name: string;
       type: InsightType;
+      source_type: 'podcast' | 'document' | 'unknown';
     }>;
   }>;
   unassigned_macro_insights: Array<{
@@ -210,13 +216,17 @@ export interface InsightHierarchy {
       id: number;
       name: string;
       type: InsightType;
+      source_type: 'podcast' | 'document' | 'unknown';
     }>;
   }>;
   orphan_unit_insights: Array<{
     id: number;
     name: string;
     type: InsightType;
+    source_type: 'podcast' | 'document' | 'unknown';
   }>;
+  latest_run_timestamp?: string | null;
+  latest_run_new_insight_ids?: number[];
 }
 
 // Search Types
@@ -246,6 +256,8 @@ export interface TrendVisualizationPoint {
   expectation?: ExpectationLevel | null;
   progress?: ProgressHorizon | null;
   adoption?: AdoptionLevel | null;
+  source_type?: 'podcast' | 'document';
+  is_new?: boolean;
 }
 
 export interface StakeVisualizationPoint {
@@ -255,6 +267,8 @@ export interface StakeVisualizationPoint {
   criticality?: CriticalityLevel | null;
   urgency?: UrgencyLevel | null;
   actionability?: ActionabilityLevel | null;
+  source_type?: 'podcast' | 'document';
+  is_new?: boolean;
 }
 
 export interface VisualizationData {

@@ -3,7 +3,14 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from innovation_intelligence.api.routers import podcasts, documents, ingestion, analysis
+from innovation_intelligence.api.routers import (
+    podcasts,
+    documents,
+    ingestion,
+    analysis,
+    media,
+    media_proxy_router as media_proxy,
+)
 from innovation_intelligence.api.routers.insight_views import router as insights_router
 from innovation_intelligence.logger import get_logger
 
@@ -28,6 +35,8 @@ app.include_router(documents.router)
 app.include_router(ingestion.router)
 app.include_router(analysis.router)
 app.include_router(insights_router)
+app.include_router(media.router)
+app.include_router(media_proxy)
 
 
 @app.get("/")

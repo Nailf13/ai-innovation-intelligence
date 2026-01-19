@@ -9,6 +9,8 @@ export interface TrendVisualizationPoint {
   expectation?: string | null;
   progress?: string | null;
   adoption?: string | null;
+  source_type?: 'podcast' | 'document';
+  is_new?: boolean;
 }
 
 export interface StakeVisualizationPoint {
@@ -18,13 +20,16 @@ export interface StakeVisualizationPoint {
   criticality?: string | null;
   urgency?: string | null;
   actionability?: string | null;
+  source_type?: 'podcast' | 'document';
+  is_new?: boolean;
 }
 
 interface ScatterPlotProps {
   data: TrendVisualizationPoint[] | StakeVisualizationPoint[];
   type: 'trend' | 'stake';
-  width?: number;
-  height?: number;
+  width?: number | undefined;
+  height?: number | undefined;
+  selectedId?: number | null;
   onPointClick?: (id: number) => void;
 }
 
@@ -62,20 +67,48 @@ const CELL_GRADIENTS = {
   ],
 };
 
-export function ScatterPlotVisualization({ 
-  data, 
-  type, 
-  width = 900, 
-  height = 650, 
-  onPointClick 
+export function ScatterPlotVisualization({
+  data,
+  type,
+  width,
+  height,
+  selectedId,
+  onPointClick
 }: ScatterPlotProps) {
   const svgRef = useRef<SVGSVGElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const onPointClickRef = useRef(onPointClick);
   const [tooltip, setTooltip] = useState<{
     visible: boolean;
     x: number;
     y: number;
     data: any;
   }>({ visible: false, x: 0, y: 0, data: null });
+  const [dimensions, setDimensions] = useState({ width: width || 1400, height: height || 900 });
+
+  // Update ref when onPointClick changes
+  useEffect(() => {
+    onPointClickRef.current = onPointClick;
+  }, [onPointClick]);
+
+  // Dynamically get container dimensions
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    const updateDimensions = () => {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) {
+        setDimensions({
+          width: rect.width,
+          height: rect.height
+        });
+      }
+    };
+
+    updateDimensions();
+    window.addEventListener('resize', updateDimensions);
+    return () => window.removeEventListener('resize', updateDimensions);
+  }, []);
 
   useEffect(() => {
     if (!svgRef.current || !data.length) return;
@@ -83,9 +116,12 @@ export function ScatterPlotVisualization({
     const svg = d3.select(svgRef.current);
     svg.selectAll('*').remove();
 
-    const margin = { top: 60, right: 200, bottom: 120, left: 150 };
-    const innerWidth = width - margin.left - margin.right;
-    const innerHeight = height - margin.top - margin.bottom;
+    const actualWidth = width || dimensions.width;
+    const actualHeight = height || dimensions.height;
+
+    const margin = { top: 60, right: 220, bottom: 100, left: 140 };
+    const innerWidth = actualWidth - margin.left - margin.right;
+    const innerHeight = actualHeight - margin.top - margin.bottom;
 
     // Add definitions for gradients and filters
     const defs = svg.append('defs');
@@ -286,10 +322,11 @@ export function ScatterPlotVisualization({
       return d.criticality && d.urgency;
     });
 
-    // Position points with better dispersion
+    // Position points with good dispersion - balanced spread
     const getPosition = (d: any, scale: d3.ScaleBand<string>, value: string, index: number) => {
       const base = (scale(value) || 0) + scale.bandwidth() / 2;
-      const jitter = (Math.sin(index * 3.2) * 0.4 + (Math.cos(index * 1.7) * 0.3) + (Math.random() - 0.5) * 0.15) * scale.bandwidth() * 0.55;
+      // Moderate jitter multiplier (0.70) for balanced spread
+      const jitter = (Math.sin(index * 3.2) * 0.45 + (Math.cos(index * 1.7) * 0.4) + (Math.random() - 0.5) * 0.25) * scale.bandwidth() * 0.50;
       return base + jitter;
     };
 
@@ -299,11 +336,26 @@ export function ScatterPlotVisualization({
     validData.forEach((d: any, i) => {
       const colorValue = d[colorKey];
       const colors = colorMap[colorValue] || { bg: '#f1f5f9', dot: '#64748b', glow: 'rgba(100, 116, 139, 0.4)' };
-      
+      const isDocument = d.source_type === 'document';
+      const isNew = d.is_new === true;
+
       const cx = getPosition(d, xScale, type === 'trend' ? d.progress : d.urgency, i);
       const cy = getPosition(d, yScale, type === 'trend' ? d.expectation : d.criticality, i * 1.7);
 
-      // Outer glow ring
+      // Layer 1: Yellow halo for new insights
+      let yellowHalo;
+      if (isNew) {
+        yellowHalo = pointsGroup.append('circle')
+          .attr('cx', cx)
+          .attr('cy', cy)
+          .attr('r', 0)
+          .attr('fill', 'none')
+          .attr('stroke', '#EAB308')
+          .attr('stroke-width', 3)
+          .attr('opacity', 0);
+      }
+
+      // Layer 2: Outer glow ring (for hover)
       const glowRing = pointsGroup.append('circle')
         .attr('cx', cx)
         .attr('cy', cy)
@@ -313,23 +365,67 @@ export function ScatterPlotVisualization({
         .attr('stroke-width', 2)
         .attr('opacity', 0);
 
-      // Main point
+      // Layer 3: White stroke (first layer)
+      const whiteStroke = pointsGroup.append('circle')
+        .attr('cx', cx)
+        .attr('cy', cy)
+        .attr('r', 0)
+        .attr('fill', 'none')
+        .attr('stroke', '#ffffff')
+        .attr('stroke-width', 3)
+        .style('cursor', 'pointer');
+
+      // Layer 4: Border ring (solid for podcasts, dashed for documents) - black halo
+      const borderRing = pointsGroup.append('circle')
+        .attr('cx', cx)
+        .attr('cy', cy)
+        .attr('r', 0)
+        .attr('fill', 'none')
+        .attr('stroke', '#1e293b')
+        .attr('stroke-width', 2)
+        .attr('stroke-dasharray', isDocument ? '3,2' : 'none')
+        .style('cursor', 'pointer');
+
+      // Layer 5: Main filled point
       const point = pointsGroup.append('circle')
         .attr('class', 'point')
+        .attr('data-point-id', d.id)
         .attr('cx', cx)
         .attr('cy', cy)
         .attr('r', 0)
         .attr('fill', colors.dot)
-        .attr('stroke', '#fff')
-        .attr('stroke-width', 3)
+        .attr('stroke', 'none')
+        .attr('stroke-width', 0)
         .style('cursor', 'pointer');
 
       // Animate in
+      const finalRadius = 7;
       point.transition()
         .duration(600)
         .delay(i * 30)
         .ease(d3.easeElasticOut.amplitude(1).period(0.5))
-        .attr('r', 10);
+        .attr('r', finalRadius);
+
+      whiteStroke.transition()
+        .duration(600)
+        .delay(i * 30)
+        .ease(d3.easeElasticOut.amplitude(1).period(0.5))
+        .attr('r', finalRadius + 1.5);
+
+      borderRing.transition()
+        .duration(600)
+        .delay(i * 30)
+        .ease(d3.easeElasticOut.amplitude(1).period(0.5))
+        .attr('r', finalRadius + 2.5);
+
+      if (yellowHalo) {
+        yellowHalo.transition()
+          .duration(600)
+          .delay(i * 30)
+          .ease(d3.easeElasticOut.amplitude(1).period(0.5))
+          .attr('r', finalRadius + 5)
+          .attr('opacity', 0.8);
+      }
 
       // Interactions
       point
@@ -337,13 +433,13 @@ export function ScatterPlotVisualization({
           d3.select(this)
             .transition()
             .duration(200)
-            .attr('r', 14)
+            .attr('r', 10)
             .attr('filter', 'url(#glow)');
 
           glowRing
             .transition()
             .duration(200)
-            .attr('r', 22)
+            .attr('r', 16)
             .attr('opacity', 0.5);
 
           const rect = svgRef.current?.getBoundingClientRect();
@@ -360,7 +456,7 @@ export function ScatterPlotVisualization({
           d3.select(this)
             .transition()
             .duration(200)
-            .attr('r', 10)
+            .attr('r', 7)
             .attr('filter', null);
 
           glowRing
@@ -372,8 +468,8 @@ export function ScatterPlotVisualization({
           setTooltip(prev => ({ ...prev, visible: false }));
         })
         .on('click', () => {
-          if (onPointClick) {
-            onPointClick(d.id);
+          if (onPointClickRef.current) {
+            onPointClickRef.current(d.id);
           }
         });
     });
@@ -382,17 +478,24 @@ export function ScatterPlotVisualization({
     const legend = g.append('g')
       .attr('transform', `translate(${innerWidth + 40}, 20)`);
 
+    // Calculate proper height based on sections
+    const colorLegendHeight = Object.keys(colorMap).length * 32 + 45; // Color entries + title + spacing
+    const sourceLegendHeight = 95; // Title + 2 source types + spacing
+    const statusLegendHeight = 65; // Title + 1 status type + spacing
+    const totalHeight = colorLegendHeight + sourceLegendHeight + statusLegendHeight + 20; // Add padding
+
     // Legend background
     legend.append('rect')
       .attr('x', -15)
       .attr('y', -15)
-      .attr('width', 160)
-      .attr('height', Object.keys(colorMap).length * 32 + 50)
+      .attr('width', 170)
+      .attr('height', totalHeight)
       .attr('rx', 12)
       .attr('fill', '#f8fafc')
       .attr('stroke', '#e2e8f0')
       .attr('stroke-width', 1);
 
+    // Section 1: Color legend (Adoption/Actionability)
     legend.append('text')
       .attr('x', 0)
       .attr('y', 5)
@@ -423,15 +526,129 @@ export function ScatterPlotVisualization({
         .text(key.length > 18 ? key.substring(0, 18) + '...' : key);
     });
 
-  }, [data, type, width, height, onPointClick]);
+    const sourceLegendY = 35 + Object.keys(colorMap).length * 32 + 20;
+
+    // Section 2: Source Type legend
+    legend.append('text')
+      .attr('x', 0)
+      .attr('y', sourceLegendY)
+      .attr('font-size', '13px')
+      .attr('font-weight', '700')
+      .attr('fill', '#1e293b')
+      .attr('letter-spacing', '0.5px')
+      .text('Source Type');
+
+    // Podcast (solid border)
+    const podcastItem = legend.append('g')
+      .attr('transform', `translate(0, ${sourceLegendY + 25})`);
+
+    podcastItem.append('circle')
+      .attr('cx', 10)
+      .attr('cy', 0)
+      .attr('r', 8)
+      .attr('fill', '#94a3b8')
+      .attr('stroke', '#1e293b')
+      .attr('stroke-width', 2);
+
+    podcastItem.append('text')
+      .attr('x', 26)
+      .attr('y', 4)
+      .attr('font-size', '11px')
+      .attr('font-weight', '500')
+      .attr('fill', '#475569')
+      .text('Podcast');
+
+    // Document (dashed border)
+    const documentItem = legend.append('g')
+      .attr('transform', `translate(0, ${sourceLegendY + 50})`);
+
+    documentItem.append('circle')
+      .attr('cx', 10)
+      .attr('cy', 0)
+      .attr('r', 8)
+      .attr('fill', '#94a3b8')
+      .attr('stroke', '#1e293b')
+      .attr('stroke-width', 2)
+      .attr('stroke-dasharray', '3,2');
+
+    documentItem.append('text')
+      .attr('x', 26)
+      .attr('y', 4)
+      .attr('font-size', '11px')
+      .attr('font-weight', '500')
+      .attr('fill', '#475569')
+      .text('Document');
+
+    // Section 3: New Insights legend
+    const newInsightsY = sourceLegendY + 100;
+
+    legend.append('text')
+      .attr('x', 0)
+      .attr('y', newInsightsY)
+      .attr('font-size', '13px')
+      .attr('font-weight', '700')
+      .attr('fill', '#1e293b')
+      .attr('letter-spacing', '0.5px')
+      .text('Status');
+
+    // New insight (yellow halo)
+    const newItem = legend.append('g')
+      .attr('transform', `translate(0, ${newInsightsY + 25})`);
+
+    newItem.append('circle')
+      .attr('cx', 10)
+      .attr('cy', 0)
+      .attr('r', 12)
+      .attr('fill', 'none')
+      .attr('stroke', '#EAB308')
+      .attr('stroke-width', 3)
+      .attr('opacity', 0.8);
+
+    newItem.append('circle')
+      .attr('cx', 10)
+      .attr('cy', 0)
+      .attr('r', 8)
+      .attr('fill', '#94a3b8')
+      .attr('stroke', '#1e293b')
+      .attr('stroke-width', 2);
+
+    newItem.append('text')
+      .attr('x', 26)
+      .attr('y', 4)
+      .attr('font-size', '11px')
+      .attr('font-weight', '500')
+      .attr('fill', '#475569')
+      .text('New Insight');
+
+  }, [data, type, dimensions.width, dimensions.height]);
+
+  // Separate effect to update selection highlighting without re-rendering entire visualization
+  useEffect(() => {
+    if (!svgRef.current) return;
+
+    console.log('🎯 Updating scatter plot selection:', selectedId);
+
+    const svg = d3.select(svgRef.current);
+
+    // Update stroke styling for all points based on selection
+    svg.selectAll('.point').each(function() {
+      const point = d3.select(this);
+      const pointId = parseInt(point.attr('data-point-id') || '0');
+      const isSelected = selectedId === pointId;
+
+      point
+        .attr('stroke', isSelected ? '#14b8a6' : '#fff') // Teal for selected, white otherwise
+        .attr('stroke-width', isSelected ? 4 : 3);
+    });
+  }, [selectedId]);
 
   return (
-    <div className="relative inline-block">
-      <svg 
-        ref={svgRef} 
-        width={width} 
-        height={height}
-        className="overflow-visible"
+    <div ref={containerRef} className="relative w-full h-full">
+      <svg
+        ref={svgRef}
+        width={width || dimensions.width}
+        height={height || dimensions.height}
+        className="w-full h-full"
         style={{ fontFamily: 'Inter, system-ui, sans-serif' }}
       />
       

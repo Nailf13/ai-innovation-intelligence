@@ -1,5 +1,6 @@
 # src/innovation_intelligence/api/routers/analysis.py
 """Analysis pipeline endpoints."""
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
@@ -21,16 +22,28 @@ router = APIRouter(prefix="/analysis", tags=["analysis"])
 # In-memory task tracking
 _analysis_tasks: dict[str, dict] = {}
 
+# Track the latest pipeline run metadata
+_latest_pipeline_run: dict[str, Any] = {
+    "timestamp": None,
+    "unit_insight_ids": [],  # IDs of unit insights created in the latest run
+}
+
 
 def _determine_episode_status(episode, session):
     """
-    Determine the current processing status of an episode.
+    Determine the current processing status of an episode based on database state.
 
-    Returns one of: "analyzed", "ready", "indexing", "transcribing", "needs_processing"
+    Returns one of: "analyzed", "ready", "indexing", "transcribing", "downloading", "needs_processing"
 
     Note: An episode is only "analyzed" if its insights have dimension assessments.
     """
-    from innovation_intelligence.db.models import UnitInsight, PodcastChunkVector, InsightDimension
+    from innovation_intelligence.db.models import UnitInsight, PodcastChunkVector, InsightDimension, EpisodeStatus
+
+    # First check the explicit status field
+    if hasattr(episode, 'status') and episode.status:
+        # If status is explicitly set and not analyzing, trust it
+        if episode.status in [EpisodeStatus.DOWNLOADING, EpisodeStatus.TRANSCRIBING, EpisodeStatus.INDEXING, EpisodeStatus.NEEDS_PROCESSING, EpisodeStatus.FAILED]:
+            return episode.status.value
 
     # Check if episode has insights with dimension assessments (fully analyzed)
     insights = session.query(UnitInsight).filter(
@@ -50,8 +63,8 @@ def _determine_episode_status(episode, session):
 
         if has_dimensions:
             return "analyzed"
-        # Has insights but no dimensions yet - still being analyzed
-        # This shouldn't happen in normal flow, but return "ready" as fallback
+        # Has insights but no dimensions yet - still being analyzed or ready
+        # Return ready as fallback (dimensions might be optional)
 
     if episode.gcs_transcript_uri:
         # Has transcript - check if indexed
@@ -64,7 +77,7 @@ def _determine_episode_status(episode, session):
             return "ready"
         else:
             return "indexing"
-    elif episode.gcs_audio_uri:
+    elif episode.gcs_audio_uri and episode.gcs_audio_uri != "":
         return "transcribing"
     else:
         return "needs_processing"
@@ -79,8 +92,16 @@ def _run_analysis_pipeline(task_id: str, config: dict):
         run_clustering_only,
         AnalysisPipelineConfig,
     )
-    from innovation_intelligence.api.sse_broadcaster import broadcast_analysis_status, broadcast_episode_status
-    from innovation_intelligence.db.models import PodcastEpisode, Document
+    from innovation_intelligence.api.sse_broadcaster import broadcast_analysis_status, broadcast_episode_status, broadcast_document_status
+    from innovation_intelligence.db.models import (
+        PodcastEpisode,
+        Document,
+        UnitInsight,
+        PodcastChunkVector,
+        DocumentChunkVector,
+        EpisodeStatus,
+        DocumentStatus,
+    )
 
     session = SessionLocal()
     try:
@@ -89,18 +110,58 @@ def _run_analysis_pipeline(task_id: str, config: dict):
         # Broadcast that analysis has started
         broadcast_analysis_status(task_id, TaskStatus.RUNNING)
 
-        # Broadcast "analyzing" status ONLY for episodes that are in "ready" state
+        # Capture unit insight IDs before the pipeline run
+        existing_insight_ids = set(
+            row[0] for row in session.query(UnitInsight.id).all()
+        )
+
+        # Set "analyzing" status for episodes and documents that are in "ready" state
         # (have indexed transcripts but no insights yet)
-        from innovation_intelligence.db.models import PodcastChunkVector, UnitInsight
+
         episodes = session.query(PodcastEpisode).filter(
             PodcastEpisode.gcs_transcript_uri.isnot(None)
         ).all()
 
+        analyzing_episode_ids = []
         for episode in episodes:
             # Only mark as "analyzing" if the episode is in "ready" state
             current_status = _determine_episode_status(episode, session)
             if current_status == "ready":
-                broadcast_episode_status(episode.id, "analyzing")
+                # Update database status
+                episode.status = EpisodeStatus.ANALYZING
+                analyzing_episode_ids.append(episode.id)
+
+        # Set "analyzing" status for documents that are in "ready" state
+        # Use the status field directly - it's the source of truth
+        documents = session.query(Document).filter(
+            Document.status == DocumentStatus.READY
+        ).all()
+
+        analyzing_document_ids = []
+        for document in documents:
+            # Update database status
+            document.status = DocumentStatus.ANALYZING
+            analyzing_document_ids.append(document.id)
+            log.info(f"[ANALYSIS] Setting document {document.id} ('{document.title}') to analyzing")
+
+        # CRITICAL: Commit status updates BEFORE broadcasting
+        # This ensures the database is updated before SSE triggers frontend refresh
+        session.commit()
+
+        # Small delay to ensure transaction is fully committed
+        import time
+        time.sleep(0.1)
+
+        log.info(f"[ANALYSIS] Set {len(analyzing_episode_ids)} episodes and {len(analyzing_document_ids)} documents to 'analyzing' status")
+
+        # Now broadcast the status changes (after commit)
+        for episode_id in analyzing_episode_ids:
+            broadcast_episode_status(episode_id, "analyzing")
+            log.info(f"[ANALYSIS] Broadcasted 'analyzing' status for episode {episode_id}")
+
+        for document_id in analyzing_document_ids:
+            broadcast_document_status(document_id, "analyzing")
+            log.info(f"[ANALYSIS] Broadcasted 'analyzing' status for document {document_id}")
 
         # Build pipeline config
         pipeline_config = AnalysisPipelineConfig(
@@ -156,18 +217,74 @@ def _run_analysis_pipeline(task_id: str, config: dict):
         session.commit()
         log.info("[ANALYSIS] Transaction committed")
 
-        # Broadcast completion and update episode statuses
+        # Capture newly created unit insight IDs
+        all_insight_ids = set(
+            row[0] for row in session.query(UnitInsight.id).all()
+        )
+        new_insight_ids = sorted(list(all_insight_ids - existing_insight_ids))
+
+        # Update global latest pipeline run tracker
+        _latest_pipeline_run["timestamp"] = datetime.now().isoformat()
+        _latest_pipeline_run["unit_insight_ids"] = new_insight_ids
+
+        log.info(f"[ANALYSIS] Pipeline created {len(new_insight_ids)} new unit insights: {new_insight_ids}")
+
+        # Update episode statuses in database and broadcast
+        all_episodes = session.query(PodcastEpisode).all()
+        for episode in all_episodes:
+            status = _determine_episode_status(episode, session)
+            # Update database status if it changed
+            if status == "analyzed":
+                episode.status = EpisodeStatus.ANALYZED
+            elif status == "ready":
+                episode.status = EpisodeStatus.READY
+
+        # Update document statuses in database and broadcast
+        all_documents = session.query(Document).all()
+        for document in all_documents:
+            # Check if document has insights with dimension assessments (fully analyzed)
+            insights = session.query(UnitInsight).filter(
+                UnitInsight.document_id == document.id
+            ).all()
+
+            if insights:
+                # Check if at least one insight has dimension assessments
+                has_dimensions = False
+                for insight in insights:
+                    from innovation_intelligence.db.models import InsightDimension
+                    dimension_count = session.query(InsightDimension).filter(
+                        InsightDimension.unit_insight_id == insight.id
+                    ).count()
+                    if dimension_count > 0:
+                        has_dimensions = True
+                        break
+
+                if has_dimensions:
+                    document.status = DocumentStatus.ANALYZED
+                else:
+                    # Has insights but no dimensions - consider it ready
+                    document.status = DocumentStatus.READY
+
+        # Commit status updates
+        session.commit()
+        log.info("[ANALYSIS] Updated episode and document statuses in database")
+
+        # Broadcast completion
         broadcast_analysis_status(
             task_id,
             TaskStatus.COMPLETED if result.success else TaskStatus.FAILED,
             result=_analysis_tasks[task_id]["result"]
         )
 
-        # Broadcast final status for ALL episodes based on their actual state
-        all_episodes = session.query(PodcastEpisode).all()
+        # Broadcast final status for ALL episodes
         for episode in all_episodes:
-            status = _determine_episode_status(episode, session)
+            status = episode.status.value if hasattr(episode, 'status') and episode.status else _determine_episode_status(episode, session)
             broadcast_episode_status(episode.id, status)
+
+        # Broadcast final status for ALL documents
+        for document in all_documents:
+            status = document.status.value if hasattr(document, 'status') and document.status else "ready"
+            broadcast_document_status(document.id, status)
 
     except Exception as e:
         log.exception("[ANALYSIS] Pipeline failed: %s", e)
@@ -186,6 +303,32 @@ def _run_analysis_pipeline(task_id: str, config: dict):
         for episode in all_episodes:
             status = _determine_episode_status(episode, session)
             broadcast_episode_status(episode.id, status)
+
+        # Restore document statuses to their correct state after failure
+        all_documents = session.query(Document).all()
+        for document in all_documents:
+            # Determine correct status based on database state
+            insights = session.query(UnitInsight).filter(
+                UnitInsight.document_id == document.id
+            ).all()
+
+            if insights:
+                from innovation_intelligence.db.models import InsightDimension
+                has_dimensions = any(
+                    session.query(InsightDimension).filter(
+                        InsightDimension.unit_insight_id == insight.id
+                    ).count() > 0
+                    for insight in insights
+                )
+                status = "analyzed" if has_dimensions else "ready"
+            else:
+                # Check if indexed
+                has_chunks = session.query(DocumentChunkVector).filter(
+                    DocumentChunkVector.source == document.title
+                ).first() is not None
+                status = "ready" if has_chunks else "indexing"
+
+            broadcast_document_status(document.id, status)
     finally:
         session.close()
 

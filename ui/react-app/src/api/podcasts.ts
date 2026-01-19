@@ -55,6 +55,12 @@ export const podcastsApi = {
     return response.data;
   },
 
+  // Retry indexing only (for episodes with transcript but failed indexing)
+  retryIndexing: async (episodeId: number): Promise<IngestionTask> => {
+    const response = await apiClient.post(`/podcasts/retry-indexing/${episodeId}`);
+    return response.data;
+  },
+
   // Get processing status
   getProcessingStatus: async (taskId: string): Promise<IngestionTask> => {
     const response = await apiClient.get(`/podcasts/process/status/${taskId}`);
@@ -70,6 +76,12 @@ export const podcastsApi = {
   // Get episode processing status
   getEpisodeProcessingStatus: async (episodeId: number): Promise<{ status: string }> => {
     const response = await apiClient.get(`/podcasts/${episodeId}/processing-status`);
+    return response.data;
+  },
+
+  // Delete an episode
+  deleteEpisode: async (episodeId: number): Promise<{ success: boolean; message: string }> => {
+    const response = await apiClient.delete(`/podcasts/${episodeId}`);
     return response.data;
   },
 };

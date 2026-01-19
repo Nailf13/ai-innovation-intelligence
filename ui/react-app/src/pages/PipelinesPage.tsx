@@ -258,26 +258,6 @@ function TaskCard({ task, onDelete }: TaskCardProps) {
             </span>
           </div>
 
-          {/* Progress for running tasks */}
-          {task.status === 'running' && analysisTask && (
-            <div className="mb-3">
-              <div className="flex items-center justify-between text-sm mb-1">
-                <span className="text-gray-600">
-                  {analysisTask.current_stage || 'Processing...'}
-                </span>
-                <span className="text-gray-500">
-                  {Math.round(analysisTask.progress * 100)}%
-                </span>
-              </div>
-              <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-savencia-primary rounded-full transition-all"
-                  style={{ width: `${analysisTask.progress * 100}%` }}
-                />
-              </div>
-            </div>
-          )}
-
           {/* Results for completed tasks */}
           {task.status === 'completed' && analysisTask?.result && (
             <div className="grid grid-cols-4 gap-4 text-sm">

@@ -322,9 +322,12 @@ class DimensionAssessmentService:
             insight_name=insight.name,
         )
 
+        # Store chunks for each dimension
+        dimension_chunks = {}
+
         for dim in dims_to_assess:
             try:
-                dim_result = self._assess_single_trend_dimension(
+                dim_result, chunks = self._assess_single_trend_dimension(
                     insight=insight,
                     dimension=dim,
                     source_filter=source_filter,
@@ -332,17 +335,20 @@ class DimensionAssessmentService:
 
                 if dim == TrendDimensionType.ADOPTION:
                     result.adoption = dim_result
+                    dimension_chunks[TrendDimensionType.ADOPTION] = chunks
                 elif dim == TrendDimensionType.EXPECTATION:
                     result.expectation = dim_result
+                    dimension_chunks[TrendDimensionType.EXPECTATION] = chunks
                 elif dim == TrendDimensionType.PROGRESS:
                     result.progress = dim_result
+                    dimension_chunks[TrendDimensionType.PROGRESS] = chunks
 
             except Exception as e:
                 log.error(f"[ASSESS] Failed to assess trend {dim.value} for {insight.name}: {e}")
 
         # Persist if configured
         if self.config.persist_results:
-            self._persist_trend_dimensions(insight, result)
+            self._persist_trend_dimensions(insight, result, dimension_chunks)
 
         return result
 
@@ -364,9 +370,12 @@ class DimensionAssessmentService:
             insight_name=insight.name,
         )
 
+        # Store chunks for each dimension
+        dimension_chunks = {}
+
         for dim in dims_to_assess:
             try:
-                dim_result = self._assess_single_stake_dimension(
+                dim_result, chunks = self._assess_single_stake_dimension(
                     insight=insight,
                     dimension=dim,
                     source_filter=source_filter,
@@ -374,17 +383,20 @@ class DimensionAssessmentService:
 
                 if dim == StakeDimensionType.CRITICALITY:
                     result.criticality = dim_result
+                    dimension_chunks[StakeDimensionType.CRITICALITY] = chunks
                 elif dim == StakeDimensionType.URGENCY:
                     result.urgency = dim_result
+                    dimension_chunks[StakeDimensionType.URGENCY] = chunks
                 elif dim == StakeDimensionType.ACTIONABILITY:
                     result.actionability = dim_result
+                    dimension_chunks[StakeDimensionType.ACTIONABILITY] = chunks
 
             except Exception as e:
                 log.error(f"[ASSESS] Failed to assess stake {dim.value} for {insight.name}: {e}")
 
         # Persist if configured
         if self.config.persist_results:
-            self._persist_stake_dimensions(insight, result)
+            self._persist_stake_dimensions(insight, result, dimension_chunks)
 
         return result
 
@@ -519,8 +531,8 @@ class DimensionAssessmentService:
         insight: UnitInsight,
         dimension: TrendDimensionType,
         source_filter: Optional[str] = None,
-    ) -> TrendDimensionResult:
-        """Assess a single TREND dimension."""
+    ) -> Tuple[TrendDimensionResult, List[Any]]:
+        """Assess a single TREND dimension and return result with retrieved chunks."""
         log.info(f"[ASSESS] Retrieving context for trend {dimension.value}...")
 
         # Reuse the precomputed embedding from UnitInsight if available
@@ -551,15 +563,15 @@ class DimensionAssessmentService:
             period=self.config.period,
         )
 
-        return result
+        return result, rag_context.chunks
 
     def _assess_single_stake_dimension(
         self,
         insight: UnitInsight,
         dimension: StakeDimensionType,
         source_filter: Optional[str] = None,
-    ) -> StakeAssessmentResult:
-        """Assess a single STAKE dimension."""
+    ) -> Tuple[StakeAssessmentResult, List[Any]]:
+        """Assess a single STAKE dimension and return result with retrieved chunks."""
         log.info(f"[ASSESS] Retrieving context for stake {dimension.value}...")
 
         # Reuse the precomputed embedding from UnitInsight if available
@@ -590,14 +602,15 @@ class DimensionAssessmentService:
             period=self.config.period,
         )
 
-        return result
+        return result, rag_context.chunks
 
     def _persist_trend_dimensions(
         self,
         insight: UnitInsight,
         dimensions: TrendDimensions,
+        dimension_chunks: Dict[TrendDimensionType, List[Any]],
     ) -> None:
-        """Persist TREND dimension results to database."""
+        """Persist TREND dimension results to database using retrieved chunks as evidence."""
         persisted = 0
 
         for dim_result, dim_type in [
@@ -618,30 +631,36 @@ class DimensionAssessmentService:
             self.session.add(db_dim)
             self.session.flush()  # Get ID
 
-            # Create evidence records
-            for ev in dim_result.evidence:
-                source_parts = [ev.source]
-                if ev.speaker:
-                    source_parts.append(ev.speaker)
-                if ev.page is not None:
-                    source_parts.append(f"p{ev.page}")
-                if ev.start_time is not None:
-                    source_parts.append(f"{ev.start_time:.1f}s")
+            # Get retrieved chunks for this dimension
+            chunks = dimension_chunks.get(dim_type, [])
 
-                # Build metadata dict from evidence
+            # Create evidence records from retrieved chunks
+            for chunk in chunks:
+                # Build metadata dict from chunk.metadata
+                # SearchResult stores metadata in a dict with keys like 'start', 'end', 'page'
                 chunk_metadata = {}
-                if ev.start_time is not None:
-                    chunk_metadata["start_time"] = ev.start_time
-                if ev.end_time is not None:
-                    chunk_metadata["end_time"] = ev.end_time
-                if ev.page is not None:
-                    chunk_metadata["page"] = ev.page
+                if chunk.metadata:
+                    # For podcast chunks: 'start', 'end', 'episode_date'
+                    if 'start' in chunk.metadata and chunk.metadata['start'] is not None:
+                        chunk_metadata["start_time"] = chunk.metadata['start']
+                    if 'end' in chunk.metadata and chunk.metadata['end'] is not None:
+                        chunk_metadata["end_time"] = chunk.metadata['end']
+                    if 'episode_date' in chunk.metadata and chunk.metadata['episode_date'] is not None:
+                        chunk_metadata["episode_date"] = chunk.metadata['episode_date']
+
+                    # For document chunks: 'page', 'section', 'document_date'
+                    if 'page' in chunk.metadata and chunk.metadata['page'] is not None:
+                        chunk_metadata["page"] = chunk.metadata['page']
+                    if 'section' in chunk.metadata and chunk.metadata['section'] is not None:
+                        chunk_metadata["section"] = chunk.metadata['section']
+                    if 'document_date' in chunk.metadata and chunk.metadata['document_date'] is not None:
+                        chunk_metadata["document_date"] = chunk.metadata['document_date']
 
                 db_evidence = DimensionEvidence(
                     dimension_id=db_dim.id,
-                    chunk_text=ev.text,
-                    similarity_score=ev.similarity_score,
-                    source_ref=" | ".join(source_parts),
+                    chunk_text=chunk.text,
+                    similarity_score=chunk.score,
+                    source_ref=chunk.source,
                     chunk_metadata=chunk_metadata if chunk_metadata else None,
                 )
                 self.session.add(db_evidence)
@@ -655,8 +674,9 @@ class DimensionAssessmentService:
         self,
         insight: UnitInsight,
         dimensions: StakeDimensions,
+        dimension_chunks: Dict[StakeDimensionType, List[Any]],
     ) -> None:
-        """Persist STAKE dimension results to database."""
+        """Persist STAKE dimension results to database using retrieved chunks as evidence."""
         persisted = 0
 
         for dim_result, dim_type in [
@@ -677,30 +697,36 @@ class DimensionAssessmentService:
             self.session.add(db_dim)
             self.session.flush()  # Get ID
 
-            # Create evidence records
-            for ev in dim_result.evidence:
-                source_parts = [ev.source]
-                if ev.speaker:
-                    source_parts.append(ev.speaker)
-                if ev.page is not None:
-                    source_parts.append(f"p{ev.page}")
-                if ev.start_time is not None:
-                    source_parts.append(f"{ev.start_time:.1f}s")
+            # Get retrieved chunks for this dimension
+            chunks = dimension_chunks.get(dim_type, [])
 
-                # Build metadata dict from evidence
+            # Create evidence records from retrieved chunks
+            for chunk in chunks:
+                # Build metadata dict from chunk.metadata
+                # SearchResult stores metadata in a dict with keys like 'start', 'end', 'page'
                 chunk_metadata = {}
-                if ev.start_time is not None:
-                    chunk_metadata["start_time"] = ev.start_time
-                if ev.end_time is not None:
-                    chunk_metadata["end_time"] = ev.end_time
-                if ev.page is not None:
-                    chunk_metadata["page"] = ev.page
+                if chunk.metadata:
+                    # For podcast chunks: 'start', 'end', 'episode_date'
+                    if 'start' in chunk.metadata and chunk.metadata['start'] is not None:
+                        chunk_metadata["start_time"] = chunk.metadata['start']
+                    if 'end' in chunk.metadata and chunk.metadata['end'] is not None:
+                        chunk_metadata["end_time"] = chunk.metadata['end']
+                    if 'episode_date' in chunk.metadata and chunk.metadata['episode_date'] is not None:
+                        chunk_metadata["episode_date"] = chunk.metadata['episode_date']
+
+                    # For document chunks: 'page', 'section', 'document_date'
+                    if 'page' in chunk.metadata and chunk.metadata['page'] is not None:
+                        chunk_metadata["page"] = chunk.metadata['page']
+                    if 'section' in chunk.metadata and chunk.metadata['section'] is not None:
+                        chunk_metadata["section"] = chunk.metadata['section']
+                    if 'document_date' in chunk.metadata and chunk.metadata['document_date'] is not None:
+                        chunk_metadata["document_date"] = chunk.metadata['document_date']
 
                 db_evidence = DimensionEvidence(
                     dimension_id=db_dim.id,
-                    chunk_text=ev.text,
-                    similarity_score=ev.similarity_score,
-                    source_ref=" | ".join(source_parts),
+                    chunk_text=chunk.text,
+                    similarity_score=chunk.score,
+                    source_ref=chunk.source,
                     chunk_metadata=chunk_metadata if chunk_metadata else None,
                 )
                 self.session.add(db_evidence)

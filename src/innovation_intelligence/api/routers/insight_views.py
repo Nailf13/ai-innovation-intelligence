@@ -23,6 +23,8 @@ from innovation_intelligence.db.models import (
     UnitInsight,
     InsightDimension,
     DimensionEvidence,
+    PodcastEpisode,
+    Document,
 )
 from innovation_intelligence.logger import get_logger
 
@@ -76,6 +78,41 @@ def list_unit_insights(
     return UnitInsightListResponse(insights=result_insights, count=total)
 
 
+def _resolve_source_to_id(source_ref: Optional[str], db: Session) -> tuple[Optional[str], Optional[int]]:
+    """
+    Resolve a source_ref string to (source_type, source_id).
+
+    For podcasts: source_ref format is "podcast_name - episode_title"
+    For documents: source_ref format is the document title
+
+    Returns:
+        Tuple of (source_type, source_id) or (None, None) if not found
+    """
+    if not source_ref:
+        return None, None
+
+    # Try podcast first (format: "podcast_name - episode_title")
+    if " - " in source_ref:
+        parts = source_ref.split(" - ", 1)
+        if len(parts) == 2:
+            podcast_name, episode_title = parts
+            episode = db.query(PodcastEpisode).filter(
+                PodcastEpisode.podcast_name == podcast_name.strip(),
+                PodcastEpisode.episode_title == episode_title.strip()
+            ).first()
+            if episode:
+                return "podcast", episode.id
+
+    # Try document (format: document title)
+    document = db.query(Document).filter(
+        Document.title == source_ref.strip()
+    ).first()
+    if document:
+        return "document", document.id
+
+    return None, None
+
+
 @router.get("/unit/{insight_id}", response_model=UnitInsightResponse)
 def get_unit_insight(insight_id: int, db: Session = Depends(get_db)):
     """Get a specific unit insight with its dimensions."""
@@ -92,11 +129,17 @@ def get_unit_insight(insight_id: int, db: Session = Depends(get_db)):
         for e in evidence:
             # Extract metadata from JSONB column
             metadata = e.chunk_metadata or {}
+
+            # Resolve source_ref to source_id
+            evidence_source_type, evidence_source_id = _resolve_source_to_id(e.source_ref, db)
+
             evidence_items.append(
                 EvidenceItem(
                     text=e.chunk_text,
                     source_ref=e.source_ref,
                     similarity_score=e.similarity_score,
+                    source_id=evidence_source_id,
+                    source_type=evidence_source_type,
                     start_time=metadata.get("start_time"),
                     end_time=metadata.get("end_time"),
                     page=metadata.get("page"),
@@ -164,14 +207,47 @@ def list_clusters(db: Session = Depends(get_db)):
 
 @router.get("/clusters/{cluster_id}", response_model=ClusterResponse)
 def get_cluster(cluster_id: int, db: Session = Depends(get_db)):
-    """Get a specific cluster with its macro insights."""
-    cluster = db.query(Cluster).options(joinedload(Cluster.macro_insights)).filter(Cluster.id == cluster_id).first()
+    """Get a specific cluster with its macro insights and orphan unit insights."""
+    cluster = db.query(Cluster).options(joinedload(Cluster.macro_insights).joinedload(MacroInsight.unit_insights)).filter(Cluster.id == cluster_id).first()
     if not cluster:
         raise HTTPException(status_code=404, detail="Cluster not found")
-    macro_insights = [MacroInsightResponse(id=m.id, name=m.name, description=m.description, cluster_id=m.cluster_id,
-        unit_insight_count=len(m.unit_insights) if m.unit_insights else 0, created_at=m.created_at) for m in cluster.macro_insights]
-    return ClusterResponse(id=cluster.id, name=cluster.name, description=cluster.description,
-        macro_insight_count=len(macro_insights), macro_insights=macro_insights)
+
+    # Get macro insights with full unit insight details
+    macro_insights = []
+    for m in cluster.macro_insights:
+        unit_insights = []
+        for ui in m.unit_insights:
+            src_type, src_id = _get_source_info(ui)
+            unit_insights.append(UnitInsightResponse(
+                id=ui.id, name=ui.name, description=ui.description, type=ui.type,
+                source_type=src_type, source_id=src_id,
+                macro_insight_id=ui.macro_insight_id, created_at=ui.created_at
+            ))
+        macro_insights.append(MacroInsightResponse(
+            id=m.id, name=m.name, description=m.description, cluster_id=m.cluster_id,
+            unit_insight_count=len(unit_insights), unit_insights=unit_insights, created_at=m.created_at
+        ))
+
+    # Get orphan unit insights directly assigned to this cluster (no macro_insight_id)
+    orphan_units = db.query(UnitInsight).filter(
+        UnitInsight.cluster_id == cluster_id,
+        UnitInsight.macro_insight_id.is_(None)
+    ).all()
+
+    orphan_unit_insights = []
+    for ui in orphan_units:
+        src_type, src_id = _get_source_info(ui)
+        orphan_unit_insights.append(UnitInsightResponse(
+            id=ui.id, name=ui.name, description=ui.description, type=ui.type,
+            source_type=src_type, source_id=src_id,
+            macro_insight_id=None, created_at=ui.created_at
+        ))
+
+    return ClusterResponse(
+        id=cluster.id, name=cluster.name, description=cluster.description,
+        macro_insight_count=len(macro_insights), macro_insights=macro_insights,
+        orphan_unit_insights=orphan_unit_insights
+    )
 
 
 @router.post("/search", response_model=SearchResultResponse)
@@ -191,6 +267,10 @@ def get_insight_hierarchy(db: Session = Depends(get_db)):
     Now includes orphan unit insights with direct cluster assignments:
     - Clusters now include both macro insights AND orphan unit insights
     - orphan_unit_insights only contains truly unassigned insights (no macro AND no cluster)
+
+    Also includes metadata about the latest pipeline run:
+    - latest_run_timestamp: ISO timestamp of the latest analysis pipeline run
+    - latest_run_new_insight_ids: List of unit insight IDs created in the latest run
     """
     # Fetch clusters with macro insights and their unit insights
     clusters = db.query(Cluster).options(
@@ -227,17 +307,20 @@ def get_insight_hierarchy(db: Session = Depends(get_db)):
                     "name": m.name,
                     "description": m.description,
                     "unit_insights": [
-                        {"id": ui.id, "name": ui.name, "type": ui.type}
+                        {"id": ui.id, "name": ui.name, "type": ui.type, "source_type": _get_source_info(ui)[0]}
                         for ui in m.unit_insights
                     ]
                 }
                 for m in c.macro_insights
             ],
             "orphan_unit_insights": [
-                {"id": ui.id, "name": ui.name, "type": ui.type}
+                {"id": ui.id, "name": ui.name, "type": ui.type, "source_type": _get_source_info(ui)[0]}
                 for ui in orphan_units_in_cluster
             ]
         })
+
+    # Import the latest pipeline run tracker
+    from innovation_intelligence.api.routers.analysis import _latest_pipeline_run
 
     return {
         "clusters": cluster_data,
@@ -247,16 +330,18 @@ def get_insight_hierarchy(db: Session = Depends(get_db)):
                 "name": m.name,
                 "description": m.description,
                 "unit_insights": [
-                    {"id": ui.id, "name": ui.name, "type": ui.type}
+                    {"id": ui.id, "name": ui.name, "type": ui.type, "source_type": _get_source_info(ui)[0]}
                     for ui in m.unit_insights
                 ]
             }
             for m in unassigned_macros
         ],
         "orphan_unit_insights": [
-            {"id": ui.id, "name": ui.name, "type": ui.type}
+            {"id": ui.id, "name": ui.name, "type": ui.type, "source_type": _get_source_info(ui)[0]}
             for ui in truly_orphan_units
         ],
+        "latest_run_timestamp": _latest_pipeline_run.get("timestamp"),
+        "latest_run_new_insight_ids": _latest_pipeline_run.get("unit_insight_ids", []),
     }
 
 
@@ -266,11 +351,16 @@ def get_visualization_data(db: Session = Depends(get_db)):
     Get unit insights with their dimension data for visualization.
 
     Returns separate datasets for trends and stakes with their dimension values.
+    Includes source_type and is_new flags for visual encoding.
     """
     # Fetch all unit insights with dimensions
     unit_insights = db.query(UnitInsight).options(
         joinedload(UnitInsight.dimensions)
     ).all()
+
+    # Import the latest pipeline run tracker
+    from innovation_intelligence.api.routers.analysis import _latest_pipeline_run
+    latest_run_ids = set(_latest_pipeline_run.get("unit_insight_ids", []))
 
     trends = []
     stakes = []
@@ -278,6 +368,10 @@ def get_visualization_data(db: Session = Depends(get_db)):
     for insight in unit_insights:
         # Create dimension map
         dim_map = {d.dimension_type: d.value for d in insight.dimensions}
+
+        # Determine source type
+        source_type, _ = _get_source_info(insight)
+        is_new = insight.id in latest_run_ids
 
         if insight.type == "trend":
             # For trends: expectation (y), progress (x), adoption (color)
@@ -288,6 +382,8 @@ def get_visualization_data(db: Session = Depends(get_db)):
                 "expectation": dim_map.get("expectation"),
                 "progress": dim_map.get("progress"),
                 "adoption": dim_map.get("adoption"),
+                "source_type": source_type,
+                "is_new": is_new,
             })
         elif insight.type == "health_stake":
             # For stakes: criticality (y), urgency (x), actionability (color)
@@ -298,6 +394,8 @@ def get_visualization_data(db: Session = Depends(get_db)):
                 "criticality": dim_map.get("criticality"),
                 "urgency": dim_map.get("urgency"),
                 "actionability": dim_map.get("actionability"),
+                "source_type": source_type,
+                "is_new": is_new,
             })
 
     return {

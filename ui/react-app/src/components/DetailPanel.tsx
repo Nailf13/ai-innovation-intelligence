@@ -1,5 +1,7 @@
 import { UnitInsight, MacroInsight, Cluster, EvidenceItem } from '../types';
-import { SourceBadge } from './common';
+import { SourceBadge, AudioPlayer } from './common';
+import { EvidenceCard } from './EvidenceCard';
+import { PdfModal } from './PdfModal';
 import {
   TrendingUp,
   AlertCircle,
@@ -7,8 +9,12 @@ import {
   Layers,
   FileText,
   Play,
+  X,
+  ChevronRight,
+  Sparkles,
 } from 'lucide-react';
 import clsx from 'clsx';
+import { useState } from 'react';
 
 // ============================================
 // Types
@@ -26,10 +32,10 @@ interface Selection {
 // ============================================
 
 const TYPE_COLORS = {
-  trend: '#3b82f6',
-  health_stake: '#f97316',
-  cluster: '#d1e3f5',
-  macro: '#22c55e',
+  trend: '#8b5cf6',
+  health_stake: '#f59e0b',
+  cluster: '#0066B3',
+  macro: '#2a894d',
 };
 
 const STAGE_COLORS: Record<string, string> = {
@@ -49,7 +55,6 @@ function formatTime(seconds: number): string {
   return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
-// Truncate text to approximately N words
 function truncateToWords(text: string, wordLimit: number = 50): string {
   const words = text.trim().split(/\s+/);
   if (words.length <= wordLimit) {
@@ -58,11 +63,36 @@ function truncateToWords(text: string, wordLimit: number = 50): string {
   return words.slice(0, wordLimit).join(' ') + '…';
 }
 
-// Parse source_ref to extract source name (first part before |)
 function parseSourceName(sourceRef: string | undefined): string | undefined {
   if (!sourceRef) return undefined;
   const parts = sourceRef.split(' | ');
   return parts[0]?.trim();
+}
+
+function selectRepresentativeEvidence(evidence: EvidenceItem[], count: number): EvidenceItem[] {
+  if (evidence.length === 0) return [];
+  if (evidence.length <= count) return evidence;
+
+  // Filter evidence with timestamps (for podcasts)
+  const evidenceWithTimestamps = evidence.filter((e) => e.start_time !== undefined);
+
+  // If we have enough evidence with timestamps, select from those
+  if (evidenceWithTimestamps.length >= count) {
+    // Sort by timestamp
+    const sorted = [...evidenceWithTimestamps].sort((a, b) => (a.start_time || 0) - (b.start_time || 0));
+
+    // Select evenly distributed samples
+    const indices = [];
+    const step = sorted.length / count;
+    for (let i = 0; i < count; i++) {
+      indices.push(Math.floor(i * step));
+    }
+
+    return indices.map((i) => sorted[i]);
+  }
+
+  // For documents or mixed sources, just take the first N items
+  return evidence.slice(0, count);
 }
 
 // ============================================
@@ -99,73 +129,75 @@ export function DetailPanel({
       {selection && (
         <>
           {/* Header */}
-          <div className="panel-header">
-            <button className="panel-close-btn" onClick={onClose}>
-              ×
+          <div className="panel-header" style={{ backgroundColor: '#0066B3', borderBottom: 'none' }}>
+            <button
+              className="panel-close-btn"
+              onClick={onClose}
+              style={{ backgroundColor: 'rgba(255, 255, 255, 0.1)' }}
+            >
+              <X className="w-5 h-5 text-white" />
             </button>
 
-            {selection.type === 'cluster' && cluster && (
-              <>
-                <div className="panel-cluster-name">Strategic Cluster</div>
-                <div className="panel-title">{cluster.name}</div>
-                <span className="panel-type-badge" style={{ background: '#6366f1', color: '#fff' }}>
-                  <Layers className="w-3 h-3 inline mr-1" />
+            <div className="panel-header-content">
+              <div className="panel-section-label text-white text-opacity-90">
+                {selection.type === 'cluster' && 'Strategic Cluster'}
+                {selection.type === 'macro' && 'Macro Insight'}
+                {selection.type === 'unit' && 'Unit Insight'}
+              </div>
+
+              <h2 className="text-xl font-semibold text-white mb-3 leading-tight">
+                {selection.type === 'cluster' && cluster?.name}
+                {selection.type === 'macro' && macro?.name}
+                {selection.type === 'unit' && unit?.name}
+              </h2>
+
+              {/* Type Badge */}
+              {selection.type === 'cluster' && (
+                <span className="inline-flex items-center px-3 py-1 rounded-md text-sm font-medium bg-white bg-opacity-40 text-white">
+                  <Layers className="w-4 h-4 mr-1.5" />
                   Cluster
                 </span>
-              </>
-            )}
-
-            {selection.type === 'macro' && macro && (
-              <>
-                <div className="panel-cluster-name">Macro Insight</div>
-                <div className="panel-title">{macro.name}</div>
-                <span className="panel-type-badge" style={{ background: TYPE_COLORS.macro, color: '#fff' }}>
+              )}
+              {selection.type === 'macro' && (
+                <span className="inline-flex items-center px-3 py-1 rounded-md text-sm font-medium bg-green-100 text-green-800">
                   Macro Insight
                 </span>
-              </>
-            )}
-
-            {selection.type === 'unit' && unit && (
-              <>
-                <div className="panel-cluster-name">Unit Insight</div>
-                <div className="panel-title">{unit.name}</div>
+              )}
+              {selection.type === 'unit' && unit && (
                 <span
-                  className="panel-type-badge"
-                  style={{
-                    background: TYPE_COLORS[unit.type] || '#64748b',
-                    color: '#fff'
-                  }}
+                  className={clsx(
+                    "inline-flex items-center px-3 py-1 rounded-md text-sm font-medium",
+                    unit.type === 'trend'
+                      ? "bg-purple-100 text-purple-800"
+                      : "bg-amber-100 text-amber-800"
+                  )}
                 >
                   {unit.type === 'trend' ? (
-                    <><TrendingUp className="w-3 h-3 inline mr-1" />Trend</>
+                    <>
+                      <TrendingUp className="w-4 h-4 mr-1.5" />
+                      Trend
+                    </>
                   ) : (
-                    <><AlertCircle className="w-3 h-3 inline mr-1" />Health Stake</>
+                    <>
+                      <AlertCircle className="w-4 h-4 mr-1.5" />
+                      Health Stake
+                    </>
                   )}
                 </span>
-              </>
-            )}
+              )}
+            </div>
           </div>
 
           {/* Content */}
           <div className="panel-content">
             {selection.type === 'cluster' && cluster && (
-              <ClusterDetail
-                cluster={cluster}
-                onSelectMacro={onSelectMacro}
-              />
+              <ClusterDetail cluster={cluster} onSelectMacro={onSelectMacro} onSelectUnit={onSelectUnit} />
             )}
             {selection.type === 'macro' && macro && (
-              <MacroDetail
-                macro={macro}
-                onSelectUnit={onSelectUnit}
-              />
+              <MacroDetail macro={macro} onSelectUnit={onSelectUnit} />
             )}
             {selection.type === 'unit' && unit && (
-              <UnitDetail
-                unit={unit}
-                onOpenVideo={onOpenVideo}
-                onOpenPdf={onOpenPdf}
-              />
+              <UnitDetail unit={unit} onOpenVideo={onOpenVideo} onOpenPdf={onOpenPdf} />
             )}
           </div>
         </>
@@ -180,55 +212,147 @@ export function DetailPanel({
 
 function ClusterDetail({
   cluster,
-  onSelectMacro
+  onSelectMacro,
+  onSelectUnit,
 }: {
   cluster: Cluster;
   onSelectMacro: (id: number) => void;
+  onSelectUnit: (id: number) => void;
 }) {
-  return (
-    <>
-      {cluster.description && (
-        <div className="panel-section">
-          <div className="panel-section-title">Description</div>
-          <div className="panel-section-content">{cluster.description}</div>
-        </div>
-      )}
+  // Collect all unit insights from all macro insights
+  const allUnitInsights: UnitInsight[] = cluster.macro_insights
+    ?.flatMap((macro) => macro.unit_insights || [])
+    .filter(Boolean) || [];
 
+  // Get orphan unit insights (standalone insights directly assigned to cluster)
+  const orphanUnitInsights: UnitInsight[] = cluster.orphan_unit_insights || [];
+
+  // Total count includes both grouped and standalone unit insights
+  const totalUnitInsightCount = allUnitInsights.length + orphanUnitInsights.length;
+
+  return (
+    <div className="detail-sections">
       <div className="panel-section">
-        <div className="panel-section-title">Statistics</div>
-        <div className="info-grid">
-          <div className="info-card">
-            <div className="info-card-label">Macro Insights</div>
-            <div className="info-card-value">{cluster.macro_insight_count}</div>
-          </div>
+        <h3 className="panel-section-title">Statistics</h3>
+        <div className="info-card">
+          <div className="info-card-label">Macro Insights</div>
+          <div className="info-card-value">{cluster.macro_insight_count}</div>
         </div>
+        <div className="info-card">
+          <div className="info-card-label">Unit Insights</div>
+          <div className="info-card-value">{totalUnitInsightCount}</div>
+        </div>
+        {orphanUnitInsights.length > 0 && (
+          <div className="info-card">
+            <div className="info-card-label">Standalone Insights</div>
+            <div className="info-card-value">{orphanUnitInsights.length}</div>
+          </div>
+        )}
       </div>
 
       {cluster.macro_insights && cluster.macro_insights.length > 0 && (
         <div className="panel-section">
-          <div className="panel-section-title">
+          <h3 className="panel-section-title">
             Macro Insights ({cluster.macro_insights.length})
-          </div>
-          <div className="panel-section-content">
+          </h3>
+          <div className="insight-list">
             {cluster.macro_insights.map((macro) => (
-              <div
+              <button
                 key={macro.id}
-                className="insight-list-item"
-                style={{ borderLeft: `4px solid ${TYPE_COLORS.macro}` }}
                 onClick={() => onSelectMacro(macro.id)}
+                className="insight-list-item"
+                style={{ borderLeftColor: TYPE_COLORS.macro }}
               >
-                <div className="font-semibold text-gray-900 mb-1">
-                  {macro.name}
+                <div className="insight-list-header">
+                  <span className="insight-list-name">{macro.name}</span>
+                  <ChevronRight className="w-4 h-4 text-gray-400" />
                 </div>
-                <div className="text-xs text-gray-500">
+                <span className="insight-list-meta">
                   {macro.unit_insight_count} unit insights
-                </div>
-              </div>
+                </span>
+              </button>
             ))}
           </div>
         </div>
       )}
-    </>
+
+      {allUnitInsights.length > 0 && (
+        <div className="panel-section">
+          <h3 className="panel-section-title">
+            Grouped Unit Insights ({allUnitInsights.length})
+          </h3>
+          <div className="insight-list">
+            {allUnitInsights.map((unit) => {
+              const typeColor = TYPE_COLORS[unit.type] || '#64748b';
+              const typeLabel = unit.type === 'health_stake' ? 'Health Stake' : 'Trend';
+
+              return (
+                <button
+                  key={unit.id}
+                  onClick={() => onSelectUnit(unit.id)}
+                  className="insight-list-item"
+                  style={{ borderLeftColor: typeColor }}
+                >
+                  <div className="insight-list-header">
+                    {unit.type === 'trend' ? (
+                      <TrendingUp className="w-4 h-4 text-purple-500 mr-2" />
+                    ) : (
+                      <AlertCircle className="w-4 h-4 text-amber-500 mr-2" />
+                    )}
+                    <span className="insight-list-name">{unit.name}</span>
+                  </div>
+                  <div className="flex items-center gap-2 mt-1">
+                    <SourceBadge sourceType={unit.source_type} size="sm" />
+                    <span className="text-xs font-medium" style={{ color: typeColor }}>
+                      {typeLabel}
+                    </span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {orphanUnitInsights.length > 0 && (
+        <div className="panel-section">
+          <h3 className="panel-section-title">
+            Standalone Unit Insights ({orphanUnitInsights.length})
+          </h3>
+          <div className="insight-list">
+            {orphanUnitInsights.map((unit) => {
+              const typeColor = TYPE_COLORS[unit.type] || '#64748b';
+              const typeLabel = unit.type === 'health_stake' ? 'Health Stake' : 'Trend';
+
+              return (
+                <button
+                  key={unit.id}
+                  onClick={() => onSelectUnit(unit.id)}
+                  className="insight-list-item"
+                  style={{ borderLeftColor: typeColor }}
+                >
+                  <div className="insight-list-header">
+                    {unit.type === 'trend' ? (
+                      <TrendingUp className="w-4 h-4 text-purple-500 mr-2" />
+                    ) : (
+                      <AlertCircle className="w-4 h-4 text-amber-500 mr-2" />
+                    )}
+                    <span className="insight-list-name">{unit.name}</span>
+                  </div>
+                  <div className="flex items-center gap-2 mt-1">
+                    <SourceBadge sourceType={unit.source_type} size="sm" />
+                    <span className="text-xs font-medium" style={{ color: typeColor }}>
+                      {typeLabel}
+                    </span>
+                    <span className="text-xs text-gray-500 italic">Standalone</span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -238,63 +362,66 @@ function ClusterDetail({
 
 function MacroDetail({
   macro,
-  onSelectUnit
+  onSelectUnit,
 }: {
   macro: MacroInsight;
   onSelectUnit: (id: number) => void;
 }) {
   return (
-    <>
+    <div className="detail-sections">
       {macro.description && (
         <div className="panel-section">
-          <div className="panel-section-title">Description</div>
-          <div className="panel-section-content">{macro.description}</div>
+          <h3 className="panel-section-title">Description</h3>
+          <p className="panel-section-content">{macro.description}</p>
         </div>
       )}
 
       <div className="panel-section">
-        <div className="panel-section-title">Statistics</div>
-        <div className="info-grid">
-          <div className="info-card">
-            <div className="info-card-label">Unit Insights</div>
-            <div className="info-card-value">{macro.unit_insight_count}</div>
-          </div>
+        <h3 className="panel-section-title">Statistics</h3>
+        <div className="info-card">
+          <div className="info-card-label">Unit Insights</div>
+          <div className="info-card-value">{macro.unit_insight_count}</div>
         </div>
       </div>
 
       {macro.unit_insights && macro.unit_insights.length > 0 && (
         <div className="panel-section">
-          <div className="panel-section-title">
+          <h3 className="panel-section-title">
             Unit Insights ({macro.unit_insights.length})
-          </div>
-          <div className="panel-section-content">
+          </h3>
+          <div className="insight-list">
             {macro.unit_insights.map((unit) => {
               const typeColor = TYPE_COLORS[unit.type] || '#64748b';
               const typeLabel = unit.type === 'health_stake' ? 'Health Stake' : 'Trend';
 
               return (
-                <div
+                <button
                   key={unit.id}
-                  className="insight-list-item"
-                  style={{ borderLeft: `4px solid ${typeColor}` }}
                   onClick={() => onSelectUnit(unit.id)}
+                  className="insight-list-item"
+                  style={{ borderLeftColor: typeColor }}
                 >
-                  <div className="font-semibold text-gray-900 mb-1">
-                    {unit.name}
+                  <div className="insight-list-header">
+                    {unit.type === 'trend' ? (
+                      <TrendingUp className="w-4 h-4 text-purple-500 mr-2" />
+                    ) : (
+                      <AlertCircle className="w-4 h-4 text-amber-500 mr-2" />
+                    )}
+                    <span className="insight-list-name">{unit.name}</span>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 mt-1">
                     <SourceBadge sourceType={unit.source_type} size="sm" />
-                    <span className="text-xs font-semibold" style={{ color: typeColor }}>
+                    <span className="text-xs font-medium" style={{ color: typeColor }}>
                       {typeLabel}
                     </span>
                   </div>
-                </div>
+                </button>
               );
             })}
           </div>
         </div>
       )}
-    </>
+    </div>
   );
 }
 
@@ -311,12 +438,40 @@ function UnitDetail({
   onOpenVideo: (url: string, start: number, end?: number, title?: string, subtitle?: string) => void;
   onOpenPdf: (page: number, path?: string) => void;
 }) {
-  // Trend dimensions
+  // State for audio player modal - keep audio loaded once opened
+  const [audioPlayerState, setAudioPlayerState] = useState<{
+    open: boolean;
+    url: string;
+    startTime: number;
+    title: string;
+  } | null>(null);
+
+  // State for PDF modal
+  const [pdfModalState, setPdfModalState] = useState<{
+    open: boolean;
+    url: string;
+    page: number;
+    title: string;
+  } | null>(null);
+
+  // Handlers for media playback
+  const handlePlayAudio = (url: string, startTime: number, title: string) => {
+    if (audioPlayerState && audioPlayerState.url === url) {
+      // Audio is already loaded, just seek to the new timestamp
+      setAudioPlayerState({ ...audioPlayerState, startTime, open: true });
+    } else {
+      // Different audio source, need to reload
+      setAudioPlayerState({ open: true, url, startTime, title });
+    }
+  };
+
+  const handleOpenPdf = (url: string, page: number, title: string) => {
+    setPdfModalState({ open: true, url, page, title });
+  };
+
   const adoptionDim = unit.dimensions.find((d) => d.dimension_type === 'adoption');
   const expectationDim = unit.dimensions.find((d) => d.dimension_type === 'expectation');
   const progressDim = unit.dimensions.find((d) => d.dimension_type === 'progress');
-
-  // Stake dimensions
   const criticalityDim = unit.dimensions.find((d) => d.dimension_type === 'criticality');
   const urgencyDim = unit.dimensions.find((d) => d.dimension_type === 'urgency');
   const actionabilityDim = unit.dimensions.find((d) => d.dimension_type === 'actionability');
@@ -324,50 +479,61 @@ function UnitDetail({
   const isTrend = unit.type === 'trend';
   const isStake = unit.type === 'health_stake';
 
+  // Collect all evidence from all dimensions and deduplicate by text
+  const allEvidence: EvidenceItem[] = unit.dimensions.flatMap((dim) => dim.evidence);
+
+  // Deduplicate evidence by text content
+  const uniqueEvidence: EvidenceItem[] = [];
+  const seenTexts = new Set<string>();
+
+  for (const item of allEvidence) {
+    const normalizedText = item.text.trim().toLowerCase();
+    if (!seenTexts.has(normalizedText)) {
+      seenTexts.add(normalizedText);
+      uniqueEvidence.push(item);
+    }
+  }
+
   return (
-    <>
+    <div className="detail-sections">
       {/* Description */}
       {unit.description && (
         <div className="panel-section">
-          <div className="panel-section-title">Description</div>
-          <div className="panel-section-content">{unit.description}</div>
+          <h3 className="panel-section-title">Description</h3>
+          <p className="panel-section-content">{unit.description}</p>
         </div>
       )}
 
       {/* Trend Dimensions */}
       {isTrend && (adoptionDim || expectationDim || progressDim) && (
         <div className="panel-section">
-          <div className="panel-section-title">Trend Dimensions</div>
-          <div className="info-grid">
+          <h3 className="panel-section-title">Trend Dimensions</h3>
+          <div className="dimension-grid">
             {adoptionDim && (
-              <div className="info-card">
-                <div className="info-card-label">Adoption Stage</div>
-                <div className="info-card-value">
-                  <span
-                    className="stage-badge text-xs"
-                    style={{
-                      background: STAGE_COLORS[adoptionDim.value] || '#64748b',
-                      color: adoptionDim.value === 'Established practice' ? '#000' : '#fff'
-                    }}
-                  >
-                    {adoptionDim.value}
-                  </span>
+              <div className="dimension-card">
+                <div className="dimension-card-label">Adoption Stage</div>
+                <div className="dimension-card-value">
+                  <TrendingUp className="w-5 h-5 inline mr-2 text-purple-500" />
+                  {adoptionDim.value}
                 </div>
               </div>
             )}
 
             {expectationDim && (
-              <div className="info-card">
-                <div className="info-card-label">Expectation Level</div>
-                <div className="info-card-value">{expectationDim.value}</div>
+              <div className="dimension-card">
+                <div className="dimension-card-label">Expectation Level</div>
+                <div className="dimension-card-value">
+                  <Sparkles className="w-5 h-5 inline mr-2 text-yellow-500" />
+                  {expectationDim.value}
+                </div>
               </div>
             )}
 
             {progressDim && (
-              <div className="info-card">
-                <div className="info-card-label">Progress Horizon</div>
-                <div className="info-card-value">
-                  <Clock className="w-4 h-4 inline mr-1 text-blue-500" />
+              <div className="dimension-card">
+                <div className="dimension-card-label">Progress Horizon</div>
+                <div className="dimension-card-value">
+                  <Clock className="w-5 h-5 inline mr-2 text-blue-500" />
                   {progressDim.value}
                 </div>
               </div>
@@ -379,33 +545,33 @@ function UnitDetail({
       {/* Stake Dimensions */}
       {isStake && (criticalityDim || urgencyDim || actionabilityDim) && (
         <div className="panel-section">
-          <div className="panel-section-title">Stake Dimensions</div>
-          <div className="info-grid">
+          <h3 className="panel-section-title">Stake Dimensions</h3>
+          <div className="dimension-grid">
             {criticalityDim && (
-              <div className="info-card">
-                <div className="info-card-label">Criticality</div>
-                <div className="info-card-value">
-                  <AlertCircle className="w-4 h-4 inline mr-1 text-red-500" />
+              <div className="dimension-card">
+                <div className="dimension-card-label">Criticality</div>
+                <div className="dimension-card-value">
+                  <AlertCircle className="w-5 h-5 inline mr-2 text-red-500" />
                   {criticalityDim.value}
                 </div>
               </div>
             )}
 
             {urgencyDim && (
-              <div className="info-card">
-                <div className="info-card-label">Urgency</div>
-                <div className="info-card-value">
-                  <Clock className="w-4 h-4 inline mr-1 text-orange-500" />
+              <div className="dimension-card">
+                <div className="dimension-card-label">Urgency</div>
+                <div className="dimension-card-value">
+                  <Clock className="w-5 h-5 inline mr-2 text-orange-500" />
                   {urgencyDim.value}
                 </div>
               </div>
             )}
 
             {actionabilityDim && (
-              <div className="info-card">
-                <div className="info-card-label">Actionability</div>
-                <div className="info-card-value">
-                  <TrendingUp className="w-4 h-4 inline mr-1 text-green-500" />
+              <div className="dimension-card">
+                <div className="dimension-card-label">Actionability</div>
+                <div className="dimension-card-value">
+                  <TrendingUp className="w-5 h-5 inline mr-2 text-green-500" />
                   {actionabilityDim.value}
                 </div>
               </div>
@@ -414,174 +580,58 @@ function UnitDetail({
         </div>
       )}
 
-      {/* Trend Evidence */}
-      {isTrend && (
-        <>
-          {adoptionDim && adoptionDim.evidence.length > 0 && (
-            <DimensionEvidence
-              title="Adoption Evidence"
-              evidence={adoptionDim.evidence}
-              confidence={adoptionDim.confidence}
-              sourceType={unit.source_type}
-              onOpenVideo={onOpenVideo}
-              onOpenPdf={onOpenPdf}
-            />
-          )}
+      {/* Evidence - All unique chunks from dimension assessment */}
+      {uniqueEvidence.length > 0 && (
+        <div className="panel-section">
+          <h3 className="panel-section-title">Evidence ({uniqueEvidence.length})</h3>
 
-          {expectationDim && expectationDim.evidence.length > 0 && (
-            <DimensionEvidence
-              title="Expectation Evidence"
-              evidence={expectationDim.evidence}
-              confidence={expectationDim.confidence}
-              sourceType={unit.source_type}
-              onOpenVideo={onOpenVideo}
-              onOpenPdf={onOpenPdf}
-            />
-          )}
-
-          {progressDim && progressDim.evidence.length > 0 && (
-            <DimensionEvidence
-              title="Progress Evidence"
-              evidence={progressDim.evidence}
-              confidence={progressDim.confidence}
-              sourceType={unit.source_type}
-              onOpenVideo={onOpenVideo}
-              onOpenPdf={onOpenPdf}
-            />
-          )}
-        </>
+          <div className="evidence-list">
+            {uniqueEvidence.map((item, i) => (
+              <EvidenceCard
+                key={i}
+                evidence={item}
+                sourceType={unit.source_type}
+                sourceId={unit.source_id || null}
+                onPlayAudio={handlePlayAudio}
+                onOpenPdf={handleOpenPdf}
+              />
+            ))}
+          </div>
+        </div>
       )}
 
-      {/* Stake Evidence */}
-      {isStake && (
-        <>
-          {criticalityDim && criticalityDim.evidence.length > 0 && (
-            <DimensionEvidence
-              title="Criticality Evidence"
-              evidence={criticalityDim.evidence}
-              confidence={criticalityDim.confidence}
-              sourceType={unit.source_type}
-              onOpenVideo={onOpenVideo}
-              onOpenPdf={onOpenPdf}
-            />
-          )}
-
-          {urgencyDim && urgencyDim.evidence.length > 0 && (
-            <DimensionEvidence
-              title="Urgency Evidence"
-              evidence={urgencyDim.evidence}
-              confidence={urgencyDim.confidence}
-              sourceType={unit.source_type}
-              onOpenVideo={onOpenVideo}
-              onOpenPdf={onOpenPdf}
-            />
-          )}
-
-          {actionabilityDim && actionabilityDim.evidence.length > 0 && (
-            <DimensionEvidence
-              title="Actionability Evidence"
-              evidence={actionabilityDim.evidence}
-              confidence={actionabilityDim.confidence}
-              sourceType={unit.source_type}
-              onOpenVideo={onOpenVideo}
-              onOpenPdf={onOpenPdf}
-            />
-          )}
-        </>
+      {/* Audio Player Modal - Persists across timestamp clicks */}
+      {audioPlayerState?.open && (
+        <div className="audio-player-modal">
+          <div className="flex items-center justify-between mb-2">
+            <h4 className="text-sm font-semibold text-gray-900">{audioPlayerState.title}</h4>
+            <button
+              onClick={() => setAudioPlayerState((prev) => prev ? { ...prev, open: false } : null)}
+              className="text-gray-400 hover:text-gray-600"
+              title="Close audio player"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          <AudioPlayer
+            key={audioPlayerState.url}
+            src={audioPlayerState.url}
+            title={audioPlayerState.title}
+            initialTime={audioPlayerState.startTime}
+          />
+        </div>
       )}
-    </>
-  );
-}
 
-// ============================================
-// Dimension Evidence Component
-// ============================================
-
-interface DimensionEvidenceProps {
-  title: string;
-  evidence: EvidenceItem[];
-  confidence?: number;
-  sourceType: 'podcast' | 'document';
-  onOpenVideo: (url: string, start: number, end?: number, title?: string, subtitle?: string) => void;
-  onOpenPdf: (page: number, path?: string) => void;
-}
-
-function DimensionEvidence({
-  title,
-  evidence,
-  confidence,
-  sourceType,
-  onOpenVideo,
-  onOpenPdf,
-}: DimensionEvidenceProps) {
-  return (
-    <div className="panel-section">
-      <div className="panel-section-title">
-        {title}
-        {confidence !== undefined && (
-          <span className="ml-2 text-xs font-normal text-gray-500">
-            ({Math.round(confidence * 100)}% confidence)
-          </span>
-        )}
-      </div>
-      <div className="panel-section-content">
-        {evidence.slice(0, 5).map((item, i) => {
-          const sourceName = parseSourceName(item.source_ref);
-          const truncatedText = truncateToWords(item.text, 50);
-
-          return (
-            <div key={i} className="evidence-card">
-              <div className="evidence-quote">"{truncatedText}"</div>
-              <div className="evidence-attribution">
-                <div className="flex items-center justify-between gap-2 text-xs text-gray-500">
-                  <div className="flex items-center gap-2">
-                    {sourceType === 'podcast' ? (
-                      <>
-                        <Play className="w-3 h-3" />
-                        <span>Podcast</span>
-                      </>
-                    ) : (
-                      <>
-                        <FileText className="w-3 h-3" />
-                        <span>Document</span>
-                      </>
-                    )}
-                    {sourceName && (
-                      <span className="text-gray-700 font-medium">• {sourceName}</span>
-                    )}
-                  </div>
-
-                  <div className="flex items-center gap-3">
-                    {/* Podcast metadata: timestamp */}
-                    {sourceType === 'podcast' && item.start_time !== undefined && (
-                      <span className="text-blue-600 font-mono">
-                        <Clock className="w-3 h-3 inline mr-1" />
-                        {formatTime(item.start_time)}
-                        {item.end_time && ` - ${formatTime(item.end_time)}`}
-                      </span>
-                    )}
-
-                    {/* Document metadata: page */}
-                    {sourceType === 'document' && item.page !== undefined && (
-                      <span className="text-purple-600 font-medium">
-                        <FileText className="w-3 h-3 inline mr-1" />
-                        Page {item.page}
-                      </span>
-                    )}
-
-                    {/* Similarity score if available */}
-                    {item.similarity_score !== undefined && (
-                      <span className="text-green-600 font-mono text-xs">
-                        {Math.round(item.similarity_score * 100)}%
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </div>
-          );
-        })}
-      </div>
+      {/* PDF Modal */}
+      {pdfModalState?.open && (
+        <PdfModal
+          open={pdfModalState.open}
+          pdfUrl={pdfModalState.url}
+          initialPage={pdfModalState.page}
+          title={pdfModalState.title}
+          onClose={() => setPdfModalState(null)}
+        />
+      )}
     </div>
   );
 }

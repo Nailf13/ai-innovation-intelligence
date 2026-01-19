@@ -286,10 +286,11 @@ def build_insights_payload(
 
 Your extraction approach:
 - Extract the {TARGET_INSIGHTS_PER_CHUNK} most significant insights from the text
-- Prioritize items by: (1) frequency of mention, (2) explicit emphasis by speakers, (3) clinical/strategic significance
+- Prioritize items by: (1) frequency of mention, (2) explicit emphasis, (3) clinical/strategic significance
 - Use precise, domain-specific terminology from the source material
 - Distinguish between evolving patterns (trends) and critical risks/opportunities (health stakes)
 - Ground every extraction in explicit textual evidence
+- Maintain a balanced distribution between trends and health stakes in the final output
 
 Quality guidelines:
 - Prefer fewer, high-quality insights over many weak ones

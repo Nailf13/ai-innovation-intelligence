@@ -4,8 +4,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import uuid
+import asyncio
+import json
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from innovation_intelligence.api.deps import get_db
@@ -17,8 +20,9 @@ from innovation_intelligence.api.schemas import (
     TaskStatus,
     SuccessResponse,
 )
+from innovation_intelligence.api.sse_broadcaster import get_broadcaster
 from innovation_intelligence.config import settings
-from innovation_intelligence.db.models import Document
+from innovation_intelligence.db.models import Document, DocumentStatus
 from innovation_intelligence.logger import get_logger
 from innovation_intelligence.ingestion.documents.document_service import DocumentService  # NEW
 
@@ -76,10 +80,18 @@ async def upload_document(
 
     document = db.query(Document).filter(Document.id == result.document_id).first()
 
-    # ✅ Automatically trigger indexing in background if transcript exists
+    # Set initial status and trigger automatic indexing
     if document.gcs_transcript_uri:
-        log.info(f"[UPLOAD] Triggering automatic indexing for document {document.id}")
+        # Text extraction succeeded, start automatic indexing
+        document.status = DocumentStatus.UPLOADING
+        db.commit()
+
+        # Trigger automatic indexing in background
         background_tasks.add_task(_run_document_indexing_background, document.id)
+    else:
+        # Upload succeeded but extraction failed
+        document.status = DocumentStatus.FAILED
+        db.commit()
 
     return DocumentUploadResponse(
         id=document.id,
@@ -99,6 +111,63 @@ def list_documents(skip: int = 0, limit: int = 50, source_type: Optional[str] = 
     total = query.count()
     documents = query.offset(skip).limit(limit).all()
     return DocumentListResponse(documents=[DocumentDB.model_validate(doc) for doc in documents], count=total)
+
+
+# ---------------------------------------------------------------------
+# Server-Sent Events (SSE) for real-time status updates
+# IMPORTANT: This route must come BEFORE /{document_id} to avoid path conflicts
+# ---------------------------------------------------------------------
+
+@router.get("/events")
+async def document_events_stream(request: Request):
+    """
+    SSE endpoint for real-time document status updates.
+
+    Clients connect to this endpoint to receive real-time notifications about:
+    - Document processing state changes (uploading → indexing → ready)
+    - Analysis state changes (ready → analyzing → analyzed)
+
+    Returns a stream of events in SSE format:
+    ```
+    data: {"type": "document_status", "document_id": 123, "status": "indexing", ...}
+    ```
+    """
+    broadcaster = get_broadcaster()
+
+    async def event_generator():
+        # Register client
+        queue = await broadcaster.connect()
+        try:
+            # Send initial connection confirmation
+            yield f"data: {json.dumps({'type': 'connected', 'message': 'SSE connection established'})}\n\n"
+
+            # Stream events
+            while True:
+                # Check if client is still connected
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    # Wait for events with timeout to check disconnection
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    # Send keepalive ping every 30 seconds
+                    yield f": keepalive\n\n"
+
+        finally:
+            # Unregister client on disconnect
+            await broadcaster.disconnect(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        }
+    )
 
 
 @router.get("/{document_id}", response_model=DocumentDB)
@@ -274,10 +343,12 @@ def _run_document_indexing_background(document_id: int):
     """
     Background task to automatically index a document after upload.
 
-    This runs silently without task tracking since it's automatic.
+    Flow: uploading → indexing → ready
     """
     from innovation_intelligence.db.session import SessionLocal
     from innovation_intelligence.db.models import DocumentChunkVector
+    from innovation_intelligence.api.sse_broadcaster import broadcast_document_status
+    import time
 
     session = SessionLocal()
     try:
@@ -289,6 +360,20 @@ def _run_document_indexing_background(document_id: int):
         if not document.gcs_transcript_uri:
             log.warning(f"[AUTO-INDEX] Document {document_id} has no transcript, skipping indexing")
             return
+
+        # Document is already in UPLOADING status from upload endpoint
+        # Broadcast uploading status
+        broadcast_document_status(document_id, "uploading")
+        log.info(f"[AUTO-INDEX] Document {document_id} in uploading state")
+
+        # Delay to ensure uploading state is visible
+        time.sleep(1.5)
+
+        # Update status to indexing
+        document.status = DocumentStatus.INDEXING
+        session.commit()
+        broadcast_document_status(document_id, "indexing")
+        log.info(f"[AUTO-INDEX] Starting indexing for document {document_id}")
 
         # Check if already indexed
         existing_chunks = session.query(DocumentChunkVector).filter(
@@ -312,8 +397,19 @@ def _run_document_indexing_background(document_id: int):
         else:
             log.info(f"[AUTO-INDEX] Document {document_id} already indexed with {existing_chunks} chunks")
 
+        # Update status to ready
+        document.status = DocumentStatus.READY
+        session.commit()
+        broadcast_document_status(document_id, "ready")
+        log.info(f"[AUTO-INDEX] Document {document_id} is ready")
+
     except Exception as e:
         log.error(f"[AUTO-INDEX] Indexing failed for document {document_id}: {e}")
+        document = session.get(Document, document_id)
+        if document:
+            document.status = DocumentStatus.FAILED
+            session.commit()
+            broadcast_document_status(document_id, "failed", error=str(e))
     finally:
         session.close()
 
@@ -322,11 +418,13 @@ def _run_document_processing(document_id: int, task_id: str):
     """Background task to index a document (manual trigger via Process button)."""
     from innovation_intelligence.db.session import SessionLocal
     from innovation_intelligence.db.models import DocumentChunkVector
+    from innovation_intelligence.api.sse_broadcaster import broadcast_document_status
+    import time
 
     session = SessionLocal()
     try:
         _processing_tasks[task_id]["status"] = TaskStatus.RUNNING
-        _processing_tasks[task_id]["current_stage"] = "index"
+        _processing_tasks[task_id]["current_stage"] = "uploading"
         _processing_tasks[task_id]["progress"] = 0.0
 
         # Fetch document
@@ -338,6 +436,21 @@ def _run_document_processing(document_id: int, task_id: str):
 
         if not document.gcs_transcript_uri:
             raise ValueError("Document has no transcript")
+
+        # Update status to uploading (simulating upload to processing queue)
+        document.status = DocumentStatus.UPLOADING
+        session.commit()
+        broadcast_document_status(document_id, "uploading")
+
+        # Delay to ensure uploading state is visible
+        time.sleep(1.5)
+
+        # Update status to indexing
+        _processing_tasks[task_id]["current_stage"] = "indexing"
+        _processing_tasks[task_id]["progress"] = 0.5
+        document.status = DocumentStatus.INDEXING
+        session.commit()
+        broadcast_document_status(document_id, "indexing")
 
         # Check if already indexed
         existing_chunks = session.query(DocumentChunkVector).filter(
@@ -366,11 +479,24 @@ def _run_document_processing(document_id: int, task_id: str):
         # Complete
         _processing_tasks[task_id]["status"] = TaskStatus.COMPLETED
         _processing_tasks[task_id]["progress"] = 1.0
+
+        # Update status to ready
+        document.status = DocumentStatus.READY
+        session.commit()
+        broadcast_document_status(document_id, "ready")
+
         log.info(f"[PROCESSING] Processing complete for document {document_id}")
 
     except Exception as e:
         log.error(f"[PROCESSING] Processing failed for document {document_id}: {e}")
         _processing_tasks[task_id]["status"] = TaskStatus.FAILED
         _processing_tasks[task_id]["error"] = str(e)
+
+        # Update status to failed
+        document = session.get(Document, document_id)
+        if document:
+            document.status = DocumentStatus.FAILED
+            session.commit()
+            broadcast_document_status(document_id, "failed", error=str(e))
     finally:
         session.close()

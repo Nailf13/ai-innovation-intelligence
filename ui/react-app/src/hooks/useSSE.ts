@@ -37,6 +37,24 @@ export function useSSE({ url, onMessage, onError, onOpen, enabled = true }: UseS
   const maxReconnectAttempts = 5;
   const baseReconnectDelay = 1000; // 1 second
 
+  // Store callbacks in refs to avoid reconnection when they change
+  const onMessageRef = useRef(onMessage);
+  const onErrorRef = useRef(onError);
+  const onOpenRef = useRef(onOpen);
+
+  // Update refs when callbacks change (without triggering reconnection)
+  useEffect(() => {
+    onMessageRef.current = onMessage;
+  }, [onMessage]);
+
+  useEffect(() => {
+    onErrorRef.current = onError;
+  }, [onError]);
+
+  useEffect(() => {
+    onOpenRef.current = onOpen;
+  }, [onOpen]);
+
   const connect = useCallback(() => {
     if (!enabled) return;
 
@@ -53,14 +71,14 @@ export function useSSE({ url, onMessage, onError, onOpen, enabled = true }: UseS
     eventSource.onopen = () => {
       console.log('[SSE] Connected');
       reconnectAttemptsRef.current = 0; // Reset reconnect counter on successful connection
-      onOpen?.();
+      onOpenRef.current?.();
     };
 
     eventSource.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
         console.log('[SSE] Received:', data);
-        onMessage?.(data);
+        onMessageRef.current?.(data);
       } catch (error) {
         console.error('[SSE] Failed to parse message:', error);
       }
@@ -68,7 +86,7 @@ export function useSSE({ url, onMessage, onError, onOpen, enabled = true }: UseS
 
     eventSource.onerror = (error) => {
       console.error('[SSE] Error:', error);
-      onError?.(error);
+      onErrorRef.current?.(error);
 
       // Close the connection
       eventSource.close();
@@ -87,7 +105,7 @@ export function useSSE({ url, onMessage, onError, onOpen, enabled = true }: UseS
         console.error('[SSE] Max reconnection attempts reached');
       }
     };
-  }, [url, onMessage, onError, onOpen, enabled]);
+  }, [url, enabled]); // Only depend on url and enabled, not callbacks
 
   useEffect(() => {
     if (enabled) {

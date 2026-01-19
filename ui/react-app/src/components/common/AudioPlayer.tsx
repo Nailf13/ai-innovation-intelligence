@@ -17,9 +17,15 @@ export function AudioPlayer({ src, title, initialTime = 0, onTimeUpdate }: Audio
   const [isMuted, setIsMuted] = useState(false);
   const [volume, setVolume] = useState(1);
 
+  // Seek to initial time when it changes (for timestamp navigation)
   useEffect(() => {
     if (audioRef.current && initialTime > 0) {
       audioRef.current.currentTime = initialTime;
+      // Auto-play when jumping to a new timestamp
+      if (!isPlaying) {
+        audioRef.current.play();
+        setIsPlaying(true);
+      }
     }
   }, [initialTime]);
 
@@ -102,6 +108,7 @@ export function AudioPlayer({ src, title, initialTime = 0, onTimeUpdate }: Audio
       <audio
         ref={audioRef}
         src={src}
+        preload="metadata"
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
         onEnded={() => setIsPlaying(false)}

@@ -27,7 +27,7 @@ export function Sidebar() {
           </div>
           <div>
             <h1 className="font-semibold text-gray-900 text-sm">Innovation</h1>
-            <p className="text-xs text-gray-500">Intelligence</p>
+            <p className="font-semibold text-gray-900 text-sm">Intelligence</p>
           </div>
         </div>
       </div>

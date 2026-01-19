@@ -211,85 +211,7 @@ def _run_extraction_stage(
 
 
 # ---------------------------------------------------------------------
-# Stage 2: Dimension Assessment
-# ---------------------------------------------------------------------
-def _run_dimension_assessment_stage(
-    session: Session,
-    config: AnalysisPipelineConfig,
-) -> StageResult:
-    """
-    Run the dimension assessment stage.
-    """
-    import time
-    from innovation_intelligence.analysis.dimensions import (
-        DimensionAssessmentService,
-        AssessmentConfig,
-        RAGEngineConfig,
-    )
-
-    start = time.time()
-    result = StageResult(stage_name="2. Dimension Assessment", success=True)
-
-    try:
-        # Configure RAG
-        rag_config = RAGEngineConfig(
-            top_k=config.dimension_top_k,
-            min_similarity=config.dimension_min_similarity,
-        )
-
-        assessment_config = AssessmentConfig(
-            rag_config=rag_config,
-            persist_results=True,
-            skip_existing=True,
-        )
-
-        service = DimensionAssessmentService(session, assessment_config)
-
-        # Get insights needing assessment
-        assessments = service.assess_new_insights()
-
-        result.items_processed = len(assessments)
-
-        # Count dimensions created (handle both TrendDimensions and StakeDimensions)
-        dimensions_count = 0
-        for a in assessments:
-            # Check if it's a TrendDimensions (has adoption attribute)
-            if hasattr(a, 'adoption'):
-                dimensions_count += sum([
-                    1 if a.adoption else 0,
-                    1 if a.expectation else 0,
-                    1 if a.progress else 0,
-                ])
-            # Otherwise it's a StakeDimensions (has criticality attribute)
-            elif hasattr(a, 'criticality'):
-                dimensions_count += sum([
-                    1 if a.criticality else 0,
-                    1 if a.urgency else 0,
-                    1 if a.actionability else 0,
-                ])
-
-        result.items_created = dimensions_count
-
-        log.info(
-            f"[PIPELINE] Assessed {result.items_created} dimensions "
-            f"for {result.items_processed} insights"
-        )
-
-    except Exception as e:
-        error_msg = f"Dimension assessment failed: {e}"
-        log.error(f"[PIPELINE] {error_msg}")
-        result.errors.append(error_msg)
-        result.success = False
-
-    result.duration_seconds = time.time() - start
-    result.details["insights_assessed"] = result.items_processed
-    result.details["dimensions_created"] = result.items_created
-
-    return result
-
-
-# ---------------------------------------------------------------------
-# Stage 3: Macro Insight Discovery
+# Stage 2: Macro Insight Discovery
 # ---------------------------------------------------------------------
 def _run_macro_discovery_stage(
     session: Session,
@@ -304,7 +226,7 @@ def _run_macro_discovery_stage(
     )
 
     start = time.time()
-    result = StageResult(stage_name="3. Macro Insight Discovery", success=True)
+    result = StageResult(stage_name="2. Macro Insight Discovery", success=True)
 
     try:
         # Count unassigned unit insights before
@@ -355,7 +277,7 @@ def _run_macro_discovery_stage(
 
 
 # ---------------------------------------------------------------------
-# Stage 4: Strategic Clustering
+# Stage 3: Strategic Clustering
 # ---------------------------------------------------------------------
 def _run_strategic_clustering_stage(
     session: Session,
@@ -375,7 +297,7 @@ def _run_strategic_clustering_stage(
     )
 
     start = time.time()
-    result = StageResult(stage_name="4. Strategic Clustering", success=True)
+    result = StageResult(stage_name="3. Strategic Clustering", success=True)
 
     try:
         # Part 1: Cluster MacroInsights
@@ -450,6 +372,84 @@ def _run_strategic_clustering_stage(
         result.success = False
 
     result.duration_seconds = time.time() - start
+
+    return result
+
+
+# ---------------------------------------------------------------------
+# Stage 4: Dimension Assessment
+# ---------------------------------------------------------------------
+def _run_dimension_assessment_stage(
+    session: Session,
+    config: AnalysisPipelineConfig,
+) -> StageResult:
+    """
+    Run the dimension assessment stage.
+    """
+    import time
+    from innovation_intelligence.analysis.dimensions import (
+        DimensionAssessmentService,
+        AssessmentConfig,
+        RAGEngineConfig,
+    )
+
+    start = time.time()
+    result = StageResult(stage_name="4. Dimension Assessment", success=True)
+
+    try:
+        # Configure RAG
+        rag_config = RAGEngineConfig(
+            top_k=config.dimension_top_k,
+            min_similarity=config.dimension_min_similarity,
+        )
+
+        assessment_config = AssessmentConfig(
+            rag_config=rag_config,
+            persist_results=True,
+            skip_existing=True,
+        )
+
+        service = DimensionAssessmentService(session, assessment_config)
+
+        # Get insights needing assessment
+        assessments = service.assess_new_insights()
+
+        result.items_processed = len(assessments)
+
+        # Count dimensions created (handle both TrendDimensions and StakeDimensions)
+        dimensions_count = 0
+        for a in assessments:
+            # Check if it's a TrendDimensions (has adoption attribute)
+            if hasattr(a, 'adoption'):
+                dimensions_count += sum([
+                    1 if a.adoption else 0,
+                    1 if a.expectation else 0,
+                    1 if a.progress else 0,
+                ])
+            # Otherwise it's a StakeDimensions (has criticality attribute)
+            elif hasattr(a, 'criticality'):
+                dimensions_count += sum([
+                    1 if a.criticality else 0,
+                    1 if a.urgency else 0,
+                    1 if a.actionability else 0,
+                ])
+
+        result.items_created = dimensions_count
+
+        log.info(
+            f"[PIPELINE] Assessed {result.items_created} dimensions "
+            f"for {result.items_processed} insights"
+        )
+
+    except Exception as e:
+        error_msg = f"Dimension assessment failed: {e}"
+        log.error(f"[PIPELINE] {error_msg}")
+        result.errors.append(error_msg)
+        result.success = False
+
+    result.duration_seconds = time.time() - start
+    result.details["insights_assessed"] = result.items_processed
+    result.details["dimensions_created"] = result.items_created
 
     return result
 
@@ -538,7 +538,6 @@ def _discover_sources(
             transcript_sources[doc.id] = doc.gcs_transcript_uri
 
     document_count = len(documents)
-    log.info(f"[PIPELINE] Found {document_count} documents ready for analysis")
     log.info(f"[PIPELINE] Total sources ready for analysis: {len(sources)}")
 
     return sources, transcript_sources

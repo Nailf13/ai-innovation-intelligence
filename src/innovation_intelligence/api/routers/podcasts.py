@@ -36,7 +36,7 @@ from innovation_intelligence.api.schemas import (
 )
 from innovation_intelligence.api.sse_broadcaster import get_broadcaster
 from innovation_intelligence.config import settings
-from innovation_intelligence.db.models import PodcastEpisode
+from innovation_intelligence.db.models import PodcastEpisode, EpisodeStatus
 from innovation_intelligence.ingestion.podcasts.podcast_index_client import PodcastIndexClient
 from innovation_intelligence.logger import get_logger
 
@@ -204,18 +204,15 @@ def select_episodes(
                 audio_url=ep_data.get("enclosureUrl", ""),
                 gcs_audio_uri="",  # Will be populated after background download
                 episode_date=episode_date,
+                status=EpisodeStatus.NEEDS_PROCESSING,
             )
             db.add(episode)
             db.flush()
-            
+
             created_episodes.append(episode)
-            
-            # Queue download in background
-            background_tasks.add_task(
-                download_episode_audio,
-                episode.id,
-                ep_data.get("enclosureUrl", ""),
-            )
+
+            # Don't auto-process - user must explicitly click "Process" button
+            # This prevents duplicate processing when episodes are added
         
         db.commit()
         
@@ -235,12 +232,14 @@ def select_episodes(
 
 def download_episode_audio(episode_id: int, audio_url: str):
     """
-    Background task to download episode audio and upload to GCS.
+    Background task to download episode audio, upload to GCS, and trigger transcription.
 
     Uses GCS-first architecture with automatic cleanup of temporary files.
     """
     from innovation_intelligence.db.session import SessionLocal
     from innovation_intelligence.ingestion.gcs_service import GCSStorageService
+    from innovation_intelligence.ingestion.podcasts.chirp_transcription import ChirpTranscriptionService
+    from innovation_intelligence.api.sse_broadcaster import broadcast_episode_status
     import requests
     import tempfile
     import os
@@ -253,6 +252,11 @@ def download_episode_audio(episode_id: int, audio_url: str):
             return
 
         log.info(f"Downloading audio for episode {episode_id}: {audio_url}")
+
+        # Update status to downloading
+        episode.status = EpisodeStatus.DOWNLOADING
+        db.commit()
+        broadcast_episode_status(episode_id, "downloading")
 
         # Download audio to temp file
         gcs_service = GCSStorageService()
@@ -281,8 +285,57 @@ def download_episode_audio(episode_id: int, audio_url: str):
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
+        # Now trigger transcription
+        log.info(f"Starting transcription for episode {episode_id}")
+        episode.status = EpisodeStatus.TRANSCRIBING
+        db.commit()
+        broadcast_episode_status(episode_id, "transcribing")
+
+        chirp_service = ChirpTranscriptionService()
+        transcript_data = chirp_service.transcribe(gcs_uri=episode.gcs_audio_uri)
+
+        # Store transcript in GCS
+        gcs_transcript_uri = gcs_service.store_transcript(
+            data=transcript_data,
+            content_id=str(episode_id),
+            content_type="podcast"
+        )
+
+        episode.gcs_transcript_uri = gcs_transcript_uri
+        db.commit()
+
+        log.info(f"Transcription complete for episode {episode_id}: {gcs_transcript_uri}")
+
+        # Now trigger indexing
+        log.info(f"Starting indexing for episode {episode_id}")
+        broadcast_episode_status(episode_id, "indexing")
+
+        from innovation_intelligence.ingestion.indexing.pipeline import VectorIndexingPipeline
+
+        pipeline = VectorIndexingPipeline(session=db)
+        chunks_created = pipeline.index_podcast_episode_from_gcs(
+            gcs_transcript_uri=episode.gcs_transcript_uri,
+            podcast_name=episode.podcast_name,
+            episode_title=episode.episode_title,
+            episode_date=episode.episode_date.isoformat() if episode.episode_date else None,
+        )
+
+        log.info(f"Indexing complete for episode {episode_id}: {chunks_created} chunks created")
+
+        # Now mark as ready for analysis
+        episode.status = EpisodeStatus.READY
+        db.commit()
+        broadcast_episode_status(episode_id, "ready")
+
+        log.info(f"Episode {episode_id} processing complete - ready for analysis")
+
     except Exception as e:
-        log.error(f"Failed to download episode {episode_id}: {e}")
+        log.error(f"Failed to process episode {episode_id}: {e}")
+        episode = db.query(PodcastEpisode).get(episode_id)
+        if episode:
+            episode.status = EpisodeStatus.FAILED
+            db.commit()
+            broadcast_episode_status(episode_id, "failed", error=str(e))
         db.rollback()
     finally:
         db.close()
@@ -297,10 +350,39 @@ def list_podcast_episodes(
     """
     List all podcast episodes in the database.
 
+    Episodes are sorted by status priority (new/unprocessed at top, analyzed at bottom):
+    1. needs_processing (not yet started)
+    2. downloading (currently downloading)
+    3. transcribing (currently being transcribed)
+    4. indexing (currently being indexed)
+    5. failed (processing failed)
+    6. ready (processed and ready for analysis)
+    7. analyzing (currently being analyzed)
+    8. analyzed (fully processed with insights) - at bottom
+
     Note: To check if an episode has been analyzed, check if it has UnitInsights
     via the /podcasts/{episode_id}/analyzed endpoint.
     """
-    episodes = db.query(PodcastEpisode).offset(skip).limit(limit).all()
+    from sqlalchemy import case
+
+    # Define status priority order (lower number = shown at top, higher number = shown at bottom)
+    status_order = case(
+        (PodcastEpisode.status == EpisodeStatus.NEEDS_PROCESSING, 1),
+        (PodcastEpisode.status == EpisodeStatus.DOWNLOADING, 2),
+        (PodcastEpisode.status == EpisodeStatus.TRANSCRIBING, 3),
+        (PodcastEpisode.status == EpisodeStatus.INDEXING, 4),
+        (PodcastEpisode.status == EpisodeStatus.FAILED, 5),
+        (PodcastEpisode.status == EpisodeStatus.READY, 6),
+        (PodcastEpisode.status == EpisodeStatus.ANALYZING, 7),
+        (PodcastEpisode.status == EpisodeStatus.ANALYZED, 8),
+        else_=9  # fallback for any unexpected status
+    )
+
+    episodes = db.query(PodcastEpisode).order_by(
+        status_order,
+        PodcastEpisode.created_at.desc()  # Within same status, newest first
+    ).offset(skip).limit(limit).all()
+
     return [PodcastEpisodeDB.model_validate(ep) for ep in episodes]
 
 
@@ -359,6 +441,32 @@ async def episode_events_stream(request: Request):
             "X-Accel-Buffering": "no",  # Disable nginx buffering
         }
     )
+
+
+@router.get("/status/{episode_id}")
+def get_episode_status(episode_id: int, db: Session = Depends(get_db)):
+    """
+    Get the current processing status of an episode.
+
+    Returns the episode's current status in the processing lifecycle:
+    - needs_processing: Not yet started
+    - downloading: Audio download in progress
+    - transcribing: Transcription in progress
+    - ready: Ready for analysis (transcribed and indexed)
+    - analyzing: Analysis in progress
+    - analyzed: Fully analyzed with dimension assessments
+    - failed: Processing failed
+    """
+    episode = db.query(PodcastEpisode).filter(PodcastEpisode.id == episode_id).first()
+    if not episode:
+        raise HTTPException(status_code=404, detail="Episode not found")
+
+    return {
+        "episode_id": episode.id,
+        "status": episode.status.value if hasattr(episode, 'status') and episode.status else "needs_processing",
+        "has_audio": bool(episode.gcs_audio_uri and episode.gcs_audio_uri != ""),
+        "has_transcript": bool(episode.gcs_transcript_uri),
+    }
 
 
 @router.get("/{episode_id}", response_model=PodcastEpisodeDB)
@@ -580,6 +688,48 @@ async def process_episode(
     return ProcessingStatusResponse(**_processing_tasks[task_id])
 
 
+@router.post("/retry-indexing/{episode_id}", response_model=ProcessingStatusResponse)
+async def retry_indexing(
+    episode_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """
+    Retry indexing for an episode that has a transcript but failed indexing.
+
+    Only works for episodes with status FAILED that have a transcript.
+    Returns task_id for status polling.
+    """
+    # Verify episode exists and has transcript
+    episode = db.query(PodcastEpisode).filter(PodcastEpisode.id == episode_id).first()
+    if not episode:
+        raise HTTPException(status_code=404, detail="Episode not found")
+
+    if not episode.gcs_transcript_uri:
+        raise HTTPException(
+            status_code=400,
+            detail="Episode must have a transcript to retry indexing. Run full processing instead."
+        )
+
+    # Create task
+    task_id = str(uuid.uuid4())
+    _processing_tasks[task_id] = {
+        "task_id": task_id,
+        "task_type": "indexing_retry",
+        "status": TaskStatus.PENDING,
+        "entity_id": episode_id,
+        "current_stage": None,
+        "progress": 0.0,
+        "error": None,
+        "result": None,
+    }
+
+    # Run in background
+    background_tasks.add_task(_run_indexing_only, episode_id, task_id)
+
+    return ProcessingStatusResponse(**_processing_tasks[task_id])
+
+
 @router.get("/process/status/{task_id}", response_model=ProcessingStatusResponse)
 def get_processing_status(task_id: str):
     """Get status of a processing task."""
@@ -621,7 +771,9 @@ def _run_podcast_processing(episode_id: int, task_id: str):
             _processing_tasks[task_id]["progress"] = 0.1
             log.info(f"[PROCESSING] Stage 1/3: Downloading audio for episode {episode_id}")
 
-            # Broadcast status change
+            # Update status in database and broadcast
+            episode.status = EpisodeStatus.DOWNLOADING
+            session.commit()
             broadcast_episode_status(episode_id, "downloading")
 
             # Download using URL and upload to GCS
@@ -665,7 +817,9 @@ def _run_podcast_processing(episode_id: int, task_id: str):
             _processing_tasks[task_id]["progress"] = 0.4
             log.info(f"[PROCESSING] Stage 2/3: Transcribing audio for episode {episode_id}")
 
-            # Broadcast status change
+            # Update status in database and broadcast
+            episode.status = EpisodeStatus.TRANSCRIBING
+            session.commit()
             broadcast_episode_status(episode_id, "transcribing")
 
             chirp_service = ChirpTranscriptionService()
@@ -689,7 +843,9 @@ def _run_podcast_processing(episode_id: int, task_id: str):
         _processing_tasks[task_id]["progress"] = 0.7
         log.info(f"[PROCESSING] Stage 3/3: Indexing transcript for episode {episode_id}")
 
-        # Broadcast status change
+        # Update status in database and broadcast
+        episode.status = EpisodeStatus.INDEXING
+        session.commit()
         broadcast_episode_status(episode_id, "indexing")
 
         # Check if already indexed
@@ -698,39 +854,149 @@ def _run_podcast_processing(episode_id: int, task_id: str):
             PodcastChunkVector.source == source
         ).count()
 
-        if existing_chunks == 0:
-            if not episode.gcs_transcript_uri:
-                raise ValueError("No transcript available for indexing")
+        try:
+            if existing_chunks == 0:
+                if not episode.gcs_transcript_uri:
+                    raise ValueError("No transcript available for indexing")
 
-            # Index the podcast - import here to avoid circular dependencies
-            from innovation_intelligence.ingestion.indexing.pipeline import VectorIndexingPipeline
+                # Index the podcast - import here to avoid circular dependencies
+                from innovation_intelligence.ingestion.indexing.pipeline import VectorIndexingPipeline
 
-            pipeline = VectorIndexingPipeline(session=session)
-            chunks_created = pipeline.index_podcast_episode_from_gcs(
-                gcs_transcript_uri=episode.gcs_transcript_uri,
-                podcast_name=episode.podcast_name,
-                episode_title=episode.episode_title,
-                episode_date=episode.episode_date.isoformat() if episode.episode_date else None,
-            )
+                pipeline = VectorIndexingPipeline(session=session)
+                chunks_created = pipeline.index_podcast_episode_from_gcs(
+                    gcs_transcript_uri=episode.gcs_transcript_uri,
+                    podcast_name=episode.podcast_name,
+                    episode_title=episode.episode_title,
+                    episode_date=episode.episode_date.isoformat() if episode.episode_date else None,
+                    raise_on_error=True,  # Raise exceptions for proper failure handling
+                )
 
-            log.info(f"[PROCESSING] Indexing complete: {chunks_created} chunks created")
-            _processing_tasks[task_id]["result"] = {"chunks_created": chunks_created}
-        else:
-            log.info(f"[PROCESSING] Skipping indexing (already indexed): {existing_chunks} chunks exist")
-            _processing_tasks[task_id]["result"] = {"chunks_created": 0, "skipped": True}
+                log.info(f"[PROCESSING] Indexing complete: {chunks_created} chunks created")
+                _processing_tasks[task_id]["result"] = {"chunks_created": chunks_created}
+            else:
+                log.info(f"[PROCESSING] Skipping indexing (already indexed): {existing_chunks} chunks exist")
+                _processing_tasks[task_id]["result"] = {"chunks_created": 0, "skipped": True}
+
+            # Complete - only set to READY if indexing succeeded
+            _processing_tasks[task_id]["status"] = TaskStatus.COMPLETED
+            _processing_tasks[task_id]["progress"] = 1.0
+            _processing_tasks[task_id]["current_stage"] = "completed"
+            log.info(f"[PROCESSING] Processing complete for episode {episode_id}")
+
+            # Update status in database and broadcast - ready for analysis
+            episode.status = EpisodeStatus.READY
+            session.commit()
+            broadcast_episode_status(episode_id, "ready")
+
+        except Exception as indexing_error:
+            # Indexing failed - keep transcript but mark as failed
+            log.error(f"[PROCESSING] Indexing failed for episode {episode_id}: {indexing_error}")
+            _processing_tasks[task_id]["status"] = TaskStatus.FAILED
+            _processing_tasks[task_id]["error"] = f"Indexing failed: {str(indexing_error)}"
+            _processing_tasks[task_id]["current_stage"] = "indexing_failed"
+
+            # Set episode status to failed - transcript is available but indexing failed
+            episode.status = EpisodeStatus.FAILED
+            session.commit()
+            broadcast_episode_status(episode_id, "failed", error=f"Indexing failed: {str(indexing_error)}")
+
+    except Exception as e:
+        # Download or transcription failed
+        log.error(f"[PROCESSING] Processing failed for episode {episode_id}: {e}")
+        _processing_tasks[task_id]["status"] = TaskStatus.FAILED
+        _processing_tasks[task_id]["error"] = str(e)
+
+        # Update episode status to failed
+        episode = session.get(PodcastEpisode, episode_id)
+        if episode:
+            episode.status = EpisodeStatus.FAILED
+            session.commit()
+            broadcast_episode_status(episode_id, "failed", error=str(e))
+    finally:
+        session.close()
+
+
+def _run_indexing_only(episode_id: int, task_id: str):
+    """
+    Background task to retry indexing for an episode that has a transcript.
+
+    This is used when indexing failed but download and transcription succeeded.
+    """
+    from innovation_intelligence.db.session import SessionLocal
+    from innovation_intelligence.db.models import PodcastChunkVector
+    from innovation_intelligence.api.sse_broadcaster import broadcast_episode_status
+
+    session = SessionLocal()
+    try:
+        _processing_tasks[task_id]["status"] = TaskStatus.RUNNING
+        _processing_tasks[task_id]["current_stage"] = "index"
+        _processing_tasks[task_id]["progress"] = 0.5
+
+        # Fetch episode
+        episode = session.get(PodcastEpisode, episode_id)
+        if not episode:
+            raise ValueError(f"Episode {episode_id} not found")
+
+        if not episode.gcs_transcript_uri:
+            raise ValueError(f"Episode {episode_id} has no transcript to index")
+
+        log.info(f"[RETRY-INDEX] Starting indexing retry for episode {episode_id}")
+
+        # Update status in database and broadcast
+        episode.status = EpisodeStatus.INDEXING
+        session.commit()
+        broadcast_episode_status(episode_id, "indexing")
+
+        # Check if already indexed (clean up any partial chunks first)
+        source = f"{episode.podcast_name} - {episode.episode_title}"
+        existing_chunks = session.query(PodcastChunkVector).filter(
+            PodcastChunkVector.source == source
+        ).count()
+
+        if existing_chunks > 0:
+            log.info(f"[RETRY-INDEX] Deleting {existing_chunks} existing chunks for clean retry")
+            session.query(PodcastChunkVector).filter(
+                PodcastChunkVector.source == source
+            ).delete()
+            session.commit()
+
+        # Index the podcast
+        from innovation_intelligence.ingestion.indexing.pipeline import VectorIndexingPipeline
+
+        pipeline = VectorIndexingPipeline(session=session)
+        chunks_created = pipeline.index_podcast_episode_from_gcs(
+            gcs_transcript_uri=episode.gcs_transcript_uri,
+            podcast_name=episode.podcast_name,
+            episode_title=episode.episode_title,
+            episode_date=episode.episode_date.isoformat() if episode.episode_date else None,
+            raise_on_error=True,  # Raise exceptions for proper failure handling
+        )
+
+        log.info(f"[RETRY-INDEX] Indexing complete: {chunks_created} chunks created")
 
         # Complete
         _processing_tasks[task_id]["status"] = TaskStatus.COMPLETED
         _processing_tasks[task_id]["progress"] = 1.0
         _processing_tasks[task_id]["current_stage"] = "completed"
-        log.info(f"[PROCESSING] Processing complete for episode {episode_id}")
+        _processing_tasks[task_id]["result"] = {"chunks_created": chunks_created}
 
-        # Broadcast final status - ready for analysis
+        # Update status in database and broadcast - ready for analysis
+        episode.status = EpisodeStatus.READY
+        session.commit()
         broadcast_episode_status(episode_id, "ready")
 
+        log.info(f"[RETRY-INDEX] Episode {episode_id} is now ready for analysis")
+
     except Exception as e:
-        log.error(f"[PROCESSING] Processing failed for episode {episode_id}: {e}")
+        log.error(f"[RETRY-INDEX] Indexing retry failed for episode {episode_id}: {e}")
         _processing_tasks[task_id]["status"] = TaskStatus.FAILED
         _processing_tasks[task_id]["error"] = str(e)
+
+        # Update episode status to failed
+        episode = session.get(PodcastEpisode, episode_id)
+        if episode:
+            episode.status = EpisodeStatus.FAILED
+            session.commit()
+            broadcast_episode_status(episode_id, "failed", error=str(e))
     finally:
         session.close()

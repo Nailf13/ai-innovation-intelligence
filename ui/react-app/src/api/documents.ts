@@ -14,6 +14,12 @@ export const documentsApi = {
     return response.data;
   },
 
+  // Alias for get (for consistency with hooks)
+  getDocument: async (id: number): Promise<Document> => {
+    const response = await apiClient.get(`/documents/${id}`);
+    return response.data;
+  },
+
   // Upload a document
   upload: async (
     file: File,

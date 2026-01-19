@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import List
+import os
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -24,12 +25,32 @@ def _load_model() -> SentenceTransformer:
     model_name = settings.embeddings.model_name
 
     log.info("[EMBED] Loading embedding model: %s", model_name)
-    model = SentenceTransformer(
-        model_name,
-        device=settings.embeddings.device,
-    )
 
-    return model
+    # Get HuggingFace token from environment
+    hf_token = os.getenv("HF_TOKEN")
+    if hf_token:
+        log.info("[EMBED] Using HuggingFace token from environment")
+    else:
+        log.warning("[EMBED] No HF_TOKEN found in environment - model download may fail for private/gated models")
+
+    try:
+        model = SentenceTransformer(
+            model_name,
+            device=settings.embeddings.device,
+            token=hf_token,  # Pass token for authentication
+        )
+        log.info("[EMBED] Model loaded successfully")
+        return model
+    except Exception as e:
+        log.error(f"[EMBED] Failed to load model {model_name}: {e}")
+        log.error("[EMBED] If this is an authentication error, ensure HF_TOKEN is set in your .env file")
+        raise
+
+
+def clear_model_cache():
+    """Clear the cached embedding model (useful for reloading with new token)."""
+    _load_model.cache_clear()
+    log.info("[EMBED] Model cache cleared")
 
 
 # ======================================================================

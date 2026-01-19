@@ -144,3 +144,22 @@ def broadcast_analysis_status(task_id: str, status: str, **kwargs):
     }
     print(f"[SSE] Broadcasting analysis {task_id} status: {status}")
     _broadcaster.broadcast_sync(event)
+
+
+def broadcast_document_status(document_id: int, status: str, **kwargs):
+    """
+    Broadcast document status change.
+
+    Args:
+        document_id: The document ID
+        status: New status (uploading, indexing, ready, analyzing, analyzed)
+        **kwargs: Additional data to include in the event
+    """
+    event = {
+        "type": "document_status",
+        "document_id": document_id,
+        "status": status,
+        **kwargs
+    }
+    print(f"[SSE] Broadcasting document {document_id} status: {status}")
+    _broadcaster.broadcast_sync(event)

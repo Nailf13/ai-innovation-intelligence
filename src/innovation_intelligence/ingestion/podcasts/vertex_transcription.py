@@ -10,10 +10,11 @@ Based on: model_garden_pytorch_whisper_large_v3_deployment.ipynb
 from __future__ import annotations
 
 import datetime
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from innovation_intelligence.config import settings
+from innovation_intelligence.config import PROJECT_ROOT, settings
 from innovation_intelligence.logger import get_logger
 
 log = get_logger(__name__)
@@ -130,10 +131,40 @@ class VertexTranscriptionService:
         )
 
     def _get_storage_client(self):
-        """Get or create Google Cloud Storage client."""
+        """Get or create Google Cloud Storage client with proper credentials handling."""
         if self._storage_client is None:
             from google.cloud import storage
-            self._storage_client = storage.Client(project=self.project_id)
+            from google.oauth2 import service_account
+
+            # Check for GOOGLE_APPLICATION_CREDENTIALS env var
+            creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+            credentials = None
+            if creds_path:
+                # Convert to absolute path if relative
+                if not Path(creds_path).is_absolute():
+                    creds_path = str(PROJECT_ROOT / creds_path)
+
+                # Load credentials from file
+                if Path(creds_path).exists():
+                    log.debug(f"[VERTEX] Loading credentials from: {creds_path}")
+                    credentials = service_account.Credentials.from_service_account_file(
+                        creds_path,
+                        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                    )
+                else:
+                    log.warning(f"[VERTEX] Credentials file not found: {creds_path}")
+
+            # Create client with explicit credentials or let it use default auth
+            if credentials:
+                self._storage_client = storage.Client(
+                    project=self.project_id,
+                    credentials=credentials,
+                )
+            else:
+                log.debug("[VERTEX] Using default credentials")
+                self._storage_client = storage.Client(project=self.project_id)
+
         return self._storage_client
 
     def _upload_to_gcs(self, local_path: Path, gcs_prefix: str = "audio") -> str:

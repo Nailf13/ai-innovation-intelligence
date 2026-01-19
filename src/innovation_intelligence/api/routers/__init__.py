@@ -7,6 +7,8 @@ from innovation_intelligence.api.routers.documents import router as documents_ro
 from innovation_intelligence.api.routers.ingestion import router as ingestion_router
 from innovation_intelligence.api.routers.analysis import router as analysis_router
 from innovation_intelligence.api.routers.insight_views import router as insights_router
+from innovation_intelligence.api.routers.media import router as media_router
+from innovation_intelligence.api.routers.media_proxy import router as media_proxy_router
 
 __all__ = [
     "podcasts_router",
@@ -14,4 +16,6 @@ __all__ = [
     "ingestion_router",
     "analysis_router",
     "insights_router",
+    "media_router",
+    "media_proxy_router",
 ]
