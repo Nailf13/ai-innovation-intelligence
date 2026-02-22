@@ -20,30 +20,45 @@ log = get_logger(__name__)
 @lru_cache(maxsize=1)
 def _load_model() -> SentenceTransformer:
     """
-    Load BGE-M3 once.
+    Load BGE-M3 once, preferring local cache to avoid slow HF downloads.
+
+    Strategy:
+    1. Try local_files_only=True (zero network calls, instant from disk)
+    2. Fall back to network-enabled load (first-ever run or missing cache)
     """
     model_name = settings.embeddings.model_name
+    hf_token = os.getenv("HF_TOKEN")
 
     log.info("[EMBED] Loading embedding model: %s", model_name)
 
-    # Get HuggingFace token from environment
-    hf_token = os.getenv("HF_TOKEN")
-    if hf_token:
-        log.info("[EMBED] Using HuggingFace token from environment")
-    else:
-        log.warning("[EMBED] No HF_TOKEN found in environment - model download may fail for private/gated models")
-
+    # Fast path: load from local HF cache without any network calls
     try:
         model = SentenceTransformer(
             model_name,
             device=settings.embeddings.device,
-            token=hf_token,  # Pass token for authentication
+            token=hf_token,
+            local_files_only=True,
         )
-        log.info("[EMBED] Model loaded successfully")
+        log.info("[EMBED] Model loaded from local cache (offline mode)")
+        return model
+    except Exception as offline_err:
+        log.warning(
+            "[EMBED] Offline load failed (%s). Falling back to network download. "
+            "This may take a long time for large models.",
+            offline_err,
+        )
+
+    # Slow path: download from HuggingFace (first run or cache missing)
+    try:
+        model = SentenceTransformer(
+            model_name,
+            device=settings.embeddings.device,
+            token=hf_token,
+        )
+        log.info("[EMBED] Model loaded via network download")
         return model
     except Exception as e:
-        log.error(f"[EMBED] Failed to load model {model_name}: {e}")
-        log.error("[EMBED] If this is an authentication error, ensure HF_TOKEN is set in your .env file")
+        log.error("[EMBED] Failed to load model %s: %s", model_name, e)
         raise
 
 
@@ -51,6 +66,45 @@ def clear_model_cache():
     """Clear the cached embedding model (useful for reloading with new token)."""
     _load_model.cache_clear()
     log.info("[EMBED] Model cache cleared")
+
+
+def preload_model() -> None:
+    """
+    Eagerly load the embedding model into memory.
+
+    Call from FastAPI lifespan startup so the first API request
+    doesn't block on model loading.
+    """
+    log.info("[EMBED] Preloading embedding model at startup...")
+    _load_model()
+    log.info("[EMBED] Embedding model preload complete")
+
+
+def download_model(force: bool = False) -> None:
+    """
+    Explicitly download or update the embedding model from HuggingFace.
+
+    Use this when you intentionally want to pull the latest model version.
+    Resumable and atomic (partial downloads won't corrupt the cache).
+
+    Args:
+        force: If True, re-download even if already cached.
+    """
+    from huggingface_hub import snapshot_download
+
+    model_name = settings.embeddings.model_name
+    hf_token = os.getenv("HF_TOKEN")
+
+    log.info("[EMBED] Downloading model: %s (force=%s)", model_name, force)
+    local_dir = snapshot_download(
+        repo_id=model_name,
+        token=hf_token,
+        force_download=force,
+    )
+    log.info("[EMBED] Model downloaded to: %s", local_dir)
+
+    _load_model.cache_clear()
+    log.info("[EMBED] In-process model cache cleared — next call will load fresh weights")
 
 
 # ======================================================================

@@ -32,8 +32,6 @@ TranscriptSource = str  # GCS URI: gs://bucket/path/to/transcript.json
 
 SourceEntity = Union[PodcastEpisode, Document]
 
-# Similarity threshold for deduplication (update instead of insert)
-DEDUP_SIMILARITY_THRESHOLD = 0.90
 
 
 # Data Structures
@@ -230,7 +228,7 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 def _find_most_similar_insight(
     session: Session,
     embedding: List[float],
-    threshold: float = DEDUP_SIMILARITY_THRESHOLD,
+    threshold: Optional[float] = None,
 ) -> Tuple[Optional[UnitInsight], float]:
     """
     Find the most similar existing insight in the database.
@@ -238,11 +236,14 @@ def _find_most_similar_insight(
     Args:
         session: Database session
         embedding: The embedding vector to compare against
-        threshold: Minimum similarity threshold to consider a match
+        threshold: Minimum similarity threshold (default from AnalysisConfig)
 
     Returns:
         Tuple of (matched UnitInsight or None, similarity score)
     """
+    if threshold is None:
+        from innovation_intelligence.analysis.analysis_config import get_analysis_config
+        threshold = get_analysis_config().thresholds.dedup
     # Get all existing insights with embeddings
     existing_insights = session.query(UnitInsight).filter(
         UnitInsight.embedding.isnot(None)
@@ -354,26 +355,29 @@ def _create_unit_insights(
     extraction: ExtractionResult,
     *,
     force: bool = False,
-    dedup_threshold: float = DEDUP_SIMILARITY_THRESHOLD,
+    dedup_threshold: Optional[float] = None,
 ) -> List[UnitInsight]:
     """
     Create or update UnitInsight rows with embeddings.
 
     Implements deduplication: if a newly extracted insight is very similar
-    (similarity >= dedup_threshold, default 0.90) to an existing insight,
-    the existing insight is UPDATED instead of creating a duplicate.
-    Sources are merged to track all contributing sources.
+    to an existing insight, the existing insight is UPDATED instead of
+    creating a duplicate.
 
     Args:
         session: Database session
         source: PodcastEpisode or Document
         extraction: Extraction result with insights
         force: If True, create even if insights already exist for this source
-        dedup_threshold: Similarity threshold for deduplication (default 0.90)
+        dedup_threshold: Similarity threshold for deduplication (default from AnalysisConfig)
 
     Returns:
         List of created or updated UnitInsight objects
     """
+    if dedup_threshold is None:
+        from innovation_intelligence.analysis.analysis_config import get_analysis_config
+        dedup_threshold = get_analysis_config().thresholds.dedup
+
     existing_count = _get_existing_insights_count(session, source)
     if existing_count > 0 and not force:
         log.info("[EXTRACT] %d UnitInsights already exist for %s, skipping", existing_count, source)

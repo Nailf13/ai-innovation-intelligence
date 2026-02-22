@@ -5,6 +5,7 @@ from enum import Enum
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    BigInteger,
     Column,
     Integer,
     String,
@@ -75,6 +76,10 @@ class PodcastEpisode(Base):
     # GCS storage URIs (primary storage)
     gcs_audio_uri = Column(String(1024), nullable=False)
     gcs_transcript_uri = Column(String(1024), nullable=True)
+
+    # Audio metadata (for fast seeking / Range request calculation)
+    audio_duration_seconds = Column(Float, nullable=True)
+    audio_file_size = Column(BigInteger, nullable=True)
 
     # Processing status
     status = Column(

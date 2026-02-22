@@ -71,6 +71,7 @@ export function InsightsPage() {
     pdfUrl?: string;
     initialPage?: number;
     title?: string;
+    cacheKey?: string;
   }>({ open: false });
 
   // Fetch hierarchy
@@ -129,8 +130,8 @@ export function InsightsPage() {
     setVideoModal({ open: false });
   }, []);
 
-  const handleOpenPdf = useCallback((url: string, page: number, title: string) => {
-    setPdfModal({ open: true, pdfUrl: url, initialPage: page, title });
+  const handleOpenPdf = useCallback((url: string, page: number, title: string, cacheKey?: string) => {
+    setPdfModal({ open: true, pdfUrl: url, initialPage: page, title, cacheKey });
   }, []);
 
   const handleClosePdf = useCallback(() => {
@@ -319,6 +320,7 @@ export function InsightsPage() {
           pdfUrl={pdfModal.pdfUrl || null}
           initialPage={pdfModal.initialPage}
           title={pdfModal.title}
+          cacheKey={pdfModal.cacheKey}
           onClose={handleClosePdf}
         />
       </div>

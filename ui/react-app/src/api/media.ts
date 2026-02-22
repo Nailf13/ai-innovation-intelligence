@@ -16,11 +16,26 @@ export interface CacheStats {
   valid_entries: number;
 }
 
+// Circuit breaker: stop calling signed-url endpoint after a 503 (service unavailable)
+let _signedUrlUnavailableUntil = 0;
+const CIRCUIT_BREAKER_MS = 10 * 60 * 1000; // 10 minutes
+
 export const mediaApi = {
   // Get signed URL for podcast audio or document
   getSignedUrl: async (request: SignedUrlRequest): Promise<SignedUrlResponse> => {
-    const response = await apiClient.post('/media/signed-url', request);
-    return response.data;
+    // Circuit breaker — skip if the service recently returned 503
+    if (Date.now() < _signedUrlUnavailableUntil) {
+      throw new Error('Signed URLs unavailable (circuit breaker open)');
+    }
+    try {
+      const response = await apiClient.post('/media/signed-url', request);
+      return response.data;
+    } catch (err: any) {
+      if (err?.response?.status === 503) {
+        _signedUrlUnavailableUntil = Date.now() + CIRCUIT_BREAKER_MS;
+      }
+      throw err;
+    }
   },
 
   // Get cache statistics

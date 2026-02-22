@@ -10,6 +10,9 @@ engine = create_engine(
     settings.db.url,
     echo=False,   # set True for SQL debug
     future=True,
+    pool_size=10,         # Support concurrent pipeline workers
+    max_overflow=10,      # Burst up to 20 connections
+    pool_pre_ping=True,   # Validate connections (pipeline runs can be long)
 )
 
 # Session factory

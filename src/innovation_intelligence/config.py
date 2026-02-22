@@ -66,6 +66,10 @@ class GCPSettings:
     # Global analysis period label (e.g. '2025')
     period_name: str = os.getenv("PERIOD_NAME", "2025")
 
+    # Service account email for signing GCS URLs (optional).
+    # If set, used instead of the default App Engine SA for signed URL generation.
+    gcs_signing_sa_email: str = os.getenv("GCS_SIGNING_SA_EMAIL", "")
+
 
 @dataclass
 class PodcastIndexSettings:

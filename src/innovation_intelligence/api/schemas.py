@@ -59,6 +59,7 @@ class PodcastEpisodeInfo(BaseModel):
     duration: Optional[int] = None
     audio_url: str
     image_url: Optional[str] = None
+    already_added: bool = False
 
 
 class PodcastSearchRequest(BaseModel):
@@ -203,11 +204,30 @@ class AnalysisRequest(BaseModel):
     skip_extraction: bool = False
     clustering_only: bool = False
     force_reextract: bool = False
-    macro_similarity_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
-    cluster_similarity_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
-    use_llm_naming: bool = True
-    generate_macro_descriptions: bool = False
-    continue_on_error: bool = True
+    macro_similarity_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    cluster_similarity_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    use_llm_naming: Optional[bool] = None
+    generate_macro_descriptions: Optional[bool] = None
+    continue_on_error: Optional[bool] = None
+
+
+class AnalysisDefaultsResponse(BaseModel):
+    """Current analysis config defaults (for frontend consumption)."""
+    macro_similarity_threshold: float
+    cluster_similarity_threshold: float
+    dedup_threshold: float
+    dimension_top_k: int
+    dimension_min_similarity: float
+    use_llm_naming: bool
+    generate_macro_descriptions: bool
+    continue_on_error: bool
+    batch_size: int
+    max_workers: int
+    min_cluster_size: int
+    label_max_tokens: int
+    label_temperature: float
+    description_max_tokens: int
+    description_temperature: float
 
 
 class StageResultResponse(BaseModel):
@@ -259,6 +279,7 @@ class PipelineStatsResponse(BaseModel):
 class EvidenceItem(BaseModel):
     """Evidence item with text and optional metadata."""
     text: str
+    display_text: Optional[str] = None  # Text without overlap for display
     source_ref: Optional[str] = None
     similarity_score: Optional[float] = None
     # Source identification (episode_id or document_id)

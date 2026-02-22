@@ -12,6 +12,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Dict, Tuple
 
+import google.auth
+import google.auth.transport.requests
+from google.auth import compute_engine, impersonated_credentials
 from google.cloud import storage
 from google.cloud.exceptions import NotFound
 
@@ -49,10 +52,42 @@ class SignedUrlService:
         """Initialize the signed URL service with GCS client."""
         self.gcs_service = GCSStorageService()
 
+        # Build signing credentials that work with ADC (user credentials)
+        self._signing_credentials = self._build_signing_credentials()
+
         # In-memory cache: {gcs_uri: (signed_url, expires_at)}
         self._cache: Dict[str, Tuple[str, datetime]] = {}
 
         log.info("[SignedUrlService] Initialized")
+
+    @staticmethod
+    def _build_signing_credentials():
+        """
+        Build credentials capable of signing blobs.
+
+        ADC user credentials cannot sign directly, so we use
+        impersonated credentials targeting a service account
+        via the IAM signBlob API.
+
+        The SA email can be configured via GCS_SIGNING_SA_EMAIL env var.
+        If not set, falls back to the App Engine default SA ({project}@appspot.gserviceaccount.com).
+        """
+        credentials, project = google.auth.default()
+
+        # If credentials already support signing (e.g. service account key), use as-is
+        if hasattr(credentials, "sign_bytes"):
+            return credentials
+
+        # Use configurable SA email, or fall back to App Engine default
+        sa_email = settings.gcp.gcs_signing_sa_email or f"{project}@appspot.gserviceaccount.com"
+        log.info(f"[SignedUrlService] Using SA for signing: {sa_email}")
+
+        signing_credentials = impersonated_credentials.Credentials(
+            source_credentials=credentials,
+            target_principal=sa_email,
+            target_scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        return signing_credentials
 
     def get_signed_url(self, gcs_uri: str, content_type: str) -> str:
         """
@@ -107,20 +142,17 @@ class SignedUrlService:
                 # For PDFs, set content-type to application/pdf to enable inline viewing
                 response_type = "application/pdf"
 
-            # Generate signed URL
+            # Generate signed URL using signing credentials
+            sign_kwargs = dict(
+                version="v4",
+                expiration=timedelta(minutes=self.SIGNED_URL_EXPIRATION_MINUTES),
+                method="GET",
+                credentials=self._signing_credentials,
+            )
             if response_type:
-                signed_url = blob.generate_signed_url(
-                    version="v4",
-                    expiration=timedelta(minutes=self.SIGNED_URL_EXPIRATION_MINUTES),
-                    method="GET",
-                    response_type=response_type,
-                )
-            else:
-                signed_url = blob.generate_signed_url(
-                    version="v4",
-                    expiration=timedelta(minutes=self.SIGNED_URL_EXPIRATION_MINUTES),
-                    method="GET",
-                )
+                sign_kwargs["response_type"] = response_type
+
+            signed_url = blob.generate_signed_url(**sign_kwargs)
 
             # Cache the signed URL
             cache_expiry = datetime.utcnow() + timedelta(minutes=self.CACHE_TTL_MINUTES)
@@ -132,7 +164,10 @@ class SignedUrlService:
         except NotFound:
             raise
         except Exception as e:
-            log.error(f"[SignedUrlService] Failed to generate signed URL for {gcs_uri}: {e}")
+            # Log as warning (not error) — signed URLs may not work with all
+            # credential types (e.g. ADC without a valid App Engine SA).
+            # Callers should fall back to the proxy endpoint.
+            log.warning(f"[SignedUrlService] Signed URL unavailable for {gcs_uri}: {e}")
             raise Exception(f"Failed to generate signed URL: {str(e)}") from e
 
     def clear_cache(self) -> int:

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Play, FileText, Mic2, Clock } from 'lucide-react';
 import { EvidenceItem } from '../types';
-import { usePodcastEpisode, useDocument } from '../hooks/useMediaAccess';
+import { usePodcastEpisode, useDocument, useSignedUrl } from '../hooks/useMediaAccess';
 import { useToast } from './common/Toast';
 import { mediaApi } from '../api/media';
 
@@ -10,7 +10,7 @@ interface EvidenceCardProps {
   sourceType: 'podcast' | 'document';
   sourceId: number | null;
   onPlayAudio?: (url: string, startTime: number, title: string) => void;
-  onOpenPdf?: (url: string, page: number, title: string) => void;
+  onOpenPdf?: (url: string, page: number, title: string, cacheKey?: string) => void;
 }
 
 export function EvidenceCard({
@@ -31,6 +31,9 @@ export function EvidenceCard({
   const { data: podcast } = usePodcastEpisode(actualSourceType === 'podcast' ? actualSourceId : null);
   const { data: document } = useDocument(actualSourceType === 'document' ? actualSourceId : null);
 
+  // Pre-fetch signed URL for documents (direct GCS download, much faster than proxy)
+  const { data: signedUrlData } = useSignedUrl('document', actualSourceType === 'document' ? actualSourceId : null);
+
   // Parse source name from source_ref
   const sourceName = parseSourceName(evidence.source_ref);
   const truncatedSource = truncateText(sourceName || 'Unknown Source', 30);
@@ -42,7 +45,7 @@ export function EvidenceCard({
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
-  // Handle audio playback using proxy URL
+  // Handle audio playback via proxy (supports HTTP Range Requests for instant seeking)
   const handlePlayAudio = () => {
     if (!actualSourceId || evidence.start_time === undefined) return;
 
@@ -54,7 +57,6 @@ export function EvidenceCard({
         : 'Podcast Episode';
 
       onPlayAudio?.(proxyUrl, evidence.start_time, title);
-      showToast('Audio ready to play', 'success');
     } catch (error) {
       console.error('Failed to play audio:', error);
       showToast('Failed to load audio', 'error');
@@ -63,17 +65,17 @@ export function EvidenceCard({
     }
   };
 
-  // Handle PDF viewing using proxy URL
+  // Handle PDF viewing — prefer signed URL (direct GCS), fallback to proxy
   const handleOpenPdf = () => {
     if (!actualSourceId || evidence.page === undefined) return;
 
     try {
       setIsLoading(true);
-      const proxyUrl = mediaApi.getProxyDocumentUrl(actualSourceId);
+      const url = signedUrlData?.signed_url || mediaApi.getProxyDocumentUrl(actualSourceId);
       const title = document?.title || 'Document';
+      const cacheKey = `document-${actualSourceId}`;
 
-      onOpenPdf?.(proxyUrl, evidence.page, title);
-      // Don't show loading toast - PDF modal will handle its own loading state
+      onOpenPdf?.(url, evidence.page, title, cacheKey);
     } catch (error) {
       console.error('Failed to open PDF:', error);
       showToast('Failed to load document', 'error');
@@ -85,7 +87,7 @@ export function EvidenceCard({
   return (
     <div className="evidence-card">
       {/* Quote */}
-      <p className="evidence-quote">"{truncateToWords(evidence.text, 50)}"</p>
+      <p className="evidence-quote">"{truncateToWords(evidence.display_text || evidence.text, 50)}"</p>
 
       {/* Metadata */}
       <div className="evidence-metadata">

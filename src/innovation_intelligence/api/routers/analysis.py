@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from innovation_intelligence.api.deps import get_db
 from innovation_intelligence.api.schemas import (
+    AnalysisDefaultsResponse,
     AnalysisRequest,
     AnalysisStatusResponse,
     PipelineStatsResponse,
@@ -163,18 +164,22 @@ def _run_analysis_pipeline(task_id: str, config: dict):
             broadcast_document_status(document_id, "analyzing")
             log.info(f"[ANALYSIS] Broadcasted 'analyzing' status for document {document_id}")
 
-        # Build pipeline config
+        # Build pipeline config, resolving None values from central AnalysisConfig
+        from innovation_intelligence.analysis.analysis_config import get_analysis_config
+        defaults = get_analysis_config()
+
         pipeline_config = AnalysisPipelineConfig(
             run_extraction=config.get("run_extraction", True),
             run_dimension_assessment=config.get("run_dimension_assessment", True),
             run_macro_discovery=config.get("run_macro_discovery", True),
             run_strategic_clustering=config.get("run_strategic_clustering", True),
             force_reextract=config.get("force_reextract", False),
-            macro_similarity_threshold=config.get("macro_similarity_threshold", 0.7),
-            cluster_similarity_threshold=config.get("cluster_similarity_threshold", 0.5),
-            use_llm_naming=config.get("use_llm_naming", True),
-            generate_macro_descriptions=config.get("generate_macro_descriptions", False),
-            continue_on_error=config.get("continue_on_error", True),
+            macro_similarity_threshold=config.get("macro_similarity_threshold") if config.get("macro_similarity_threshold") is not None else defaults.thresholds.macro_discovery,
+            cluster_similarity_threshold=config.get("cluster_similarity_threshold") if config.get("cluster_similarity_threshold") is not None else defaults.thresholds.strategic_clustering,
+            use_llm_naming=config.get("use_llm_naming") if config.get("use_llm_naming") is not None else defaults.llm_naming.use_llm_naming,
+            generate_macro_descriptions=config.get("generate_macro_descriptions") if config.get("generate_macro_descriptions") is not None else defaults.llm_naming.generate_descriptions,
+            continue_on_error=config.get("continue_on_error") if config.get("continue_on_error") is not None else defaults.processing.continue_on_error,
+            dedup_threshold=defaults.thresholds.dedup,
         )
 
         # Determine which pipeline to run
@@ -331,6 +336,30 @@ def _run_analysis_pipeline(task_id: str, config: dict):
             broadcast_document_status(document.id, status)
     finally:
         session.close()
+
+
+@router.get("/defaults", response_model=AnalysisDefaultsResponse)
+def get_analysis_defaults():
+    """Get current analysis parameter defaults."""
+    from innovation_intelligence.analysis.analysis_config import get_analysis_config
+    cfg = get_analysis_config()
+    return AnalysisDefaultsResponse(
+        macro_similarity_threshold=cfg.thresholds.macro_discovery,
+        cluster_similarity_threshold=cfg.thresholds.strategic_clustering,
+        dedup_threshold=cfg.thresholds.dedup,
+        dimension_top_k=cfg.rag.top_k,
+        dimension_min_similarity=cfg.rag.min_similarity,
+        use_llm_naming=cfg.llm_naming.use_llm_naming,
+        generate_macro_descriptions=cfg.llm_naming.generate_descriptions,
+        continue_on_error=cfg.processing.continue_on_error,
+        batch_size=cfg.processing.batch_size,
+        max_workers=cfg.processing.max_workers,
+        min_cluster_size=cfg.thresholds.min_cluster_size,
+        label_max_tokens=cfg.llm_naming.label_max_tokens,
+        label_temperature=cfg.llm_naming.label_temperature,
+        description_max_tokens=cfg.llm_naming.description_max_tokens,
+        description_temperature=cfg.llm_naming.description_temperature,
+    )
 
 
 @router.post("/run", response_model=AnalysisStatusResponse)

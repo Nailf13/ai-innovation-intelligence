@@ -4,7 +4,8 @@ import { podcastsApi } from '../api/podcasts';
 import { documentsApi } from '../api/documents';
 import { PodcastEpisode, Document } from '../types';
 
-// Hook to get signed URL with caching
+// Hook to get signed URL with caching.
+// Fails silently — callers should always have a proxy URL fallback.
 export function useSignedUrl(
   sourceType: 'podcast' | 'document',
   sourceId: number | null,
@@ -18,9 +19,8 @@ export function useSignedUrl(
     },
     enabled: enabled && sourceId !== null,
     staleTime: 40 * 60 * 1000, // 40 minutes (before 45-min server cache expires)
-    gcTime: 50 * 60 * 1000, // 50 minutes (previously called cacheTime)
-    retry: 2,
-    retryDelay: 1000,
+    gcTime: 50 * 60 * 1000, // 50 minutes
+    retry: false, // Don't retry — fall back to proxy if signed URLs fail
   });
 }
 

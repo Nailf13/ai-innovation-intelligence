@@ -58,7 +58,7 @@ class RAGEngineConfig:
     top_k: int = 3
 
     # Minimum similarity threshold (0-1)
-    min_similarity: float = 0.6
+    min_similarity: float = 0.4
 
     # Maximum total context length
     max_context_chars: int = 200_000
@@ -74,6 +74,21 @@ class RAGEngineConfig:
 
     # Deduplication similarity threshold
     dedup_threshold: float = 0.9
+
+    @classmethod
+    def from_analysis_config(cls) -> "RAGEngineConfig":
+        """Construct from the central AnalysisConfig."""
+        from innovation_intelligence.analysis.analysis_config import get_analysis_config
+        cfg = get_analysis_config()
+        return cls(
+            top_k=cfg.rag.top_k,
+            min_similarity=cfg.rag.min_similarity,
+            max_context_chars=cfg.rag.max_context_chars,
+            include_podcasts=cfg.rag.include_podcasts,
+            include_documents=cfg.rag.include_documents,
+            deduplicate=cfg.rag.deduplicate,
+            dedup_threshold=cfg.rag.chunk_dedup_threshold,
+        )
 
 
 class RAGEngine:
@@ -131,15 +146,16 @@ class RAGEngine:
 
         log.info(f"[RAG] Query: {enhanced_query[:100]}...")
 
-        # Reuse precomputed embedding if available
-        # Note: Even with dimension hints, the base insight embedding provides
-        # good semantic similarity for retrieval. The hints mainly help the LLM
-        # understand what to look for in the context.
-        if precomputed_embedding is not None:
+        # Dimension hints take priority over precomputed embedding
+        if dimension_hints:
+            query_embedding = embed_text(enhanced_query)
+            log.debug("[RAG] Embedded dimension-specific query (hints present)")
+        elif precomputed_embedding is not None:
             query_embedding = precomputed_embedding
-            log.debug("[RAG] Reusing precomputed embedding from UnitInsight")
+            log.debug("[RAG] Reusing precomputed embedding (no dimension hints)")
         else:
             query_embedding = embed_text(enhanced_query)
+            log.debug("[RAG] Embedded base query (no precomputed embedding)")
 
         # Retrieve chunks
         k = top_k or self.config.top_k

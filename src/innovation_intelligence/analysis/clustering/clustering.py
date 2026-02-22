@@ -41,8 +41,13 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------
-DEFAULT_SIMILARITY_THRESHOLD = 0.5
 OTHER_CLUSTER_NAME = "Other"
+
+
+def _default_cluster_threshold() -> float:
+    """Resolve the default clustering threshold from central config."""
+    from innovation_intelligence.analysis.analysis_config import get_analysis_config
+    return get_analysis_config().thresholds.strategic_clustering
 
 
 class ClusterDefinitionType(str, Enum):
@@ -352,7 +357,7 @@ def get_cluster_embedding_cache() -> ClusterEmbeddingCache:
 def find_best_cluster(
     macro_embedding: np.ndarray,
     cluster_embeddings: Dict[str, np.ndarray],
-    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    similarity_threshold: Optional[float] = None,
 ) -> Tuple[str, float, bool]:
     """
     Find the best matching cluster for a macro insight embedding.
@@ -366,6 +371,9 @@ def find_best_cluster(
         Tuple of (cluster_name, similarity_score, is_other)
         is_other is True if similarity was below threshold
     """
+    if similarity_threshold is None:
+        similarity_threshold = _default_cluster_threshold()
+
     if len(cluster_embeddings) == 0:
         return OTHER_CLUSTER_NAME, 0.0, True
 
@@ -387,7 +395,7 @@ def find_best_cluster(
 def assign_macro_insight(
     macro: MacroInsight,
     cluster_cache: ClusterEmbeddingCache,
-    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    similarity_threshold: Optional[float] = None,
 ) -> ClusterAssignment:
     """
     Assign a single macro insight to a strategic cluster.
@@ -430,7 +438,7 @@ def assign_macro_insight_with_change_tracking(
     macro: MacroInsight,
     cluster_cache: ClusterEmbeddingCache,
     session: Session,
-    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    similarity_threshold: Optional[float] = None,
 ) -> ClusterAssignmentChange:
     """
     Assign a macro insight to a cluster and track changes from previous assignment.
@@ -477,7 +485,7 @@ def assign_macro_insight_with_change_tracking(
 # ---------------------------------------------------------------------
 def assign_macro_insights_to_clusters(
     macro_insights: Sequence[MacroInsight],
-    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    similarity_threshold: Optional[float] = None,
     cluster_cache: Optional[ClusterEmbeddingCache] = None,
 ) -> ClusteringResult:
     """
@@ -493,6 +501,9 @@ def assign_macro_insights_to_clusters(
     Returns:
         ClusteringResult with all assignments and statistics
     """
+    if similarity_threshold is None:
+        similarity_threshold = _default_cluster_threshold()
+
     if not macro_insights:
         log.info("[CLUSTER] No macro insights to process")
         return ClusteringResult()
@@ -615,7 +626,7 @@ def persist_cluster_assignments(
 def assign_and_persist_macro_insights(
     session: Session,
     macro_insight_ids: Optional[List[int]] = None,
-    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    similarity_threshold: Optional[float] = None,
 ) -> ClusteringResult:
     """
     End-to-end macro insight clustering and persistence.
@@ -664,7 +675,7 @@ def assign_and_persist_macro_insights(
 def assign_macro_insights_incremental(
     session: Session,
     macro_insights: Sequence[MacroInsight],
-    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    similarity_threshold: Optional[float] = None,
     cluster_cache: Optional[ClusterEmbeddingCache] = None,
 ) -> IncrementalClusteringResult:
     """
@@ -682,6 +693,9 @@ def assign_macro_insights_incremental(
     Returns:
         IncrementalClusteringResult with change tracking information
     """
+    if similarity_threshold is None:
+        similarity_threshold = _default_cluster_threshold()
+
     if not macro_insights:
         log.info("[CLUSTER] No macro insights to process")
         return IncrementalClusteringResult()
@@ -788,7 +802,7 @@ def persist_incremental_cluster_assignments(
 def update_cluster_assignments(
     session: Session,
     macro_insight_ids: List[int],
-    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    similarity_threshold: Optional[float] = None,
 ) -> IncrementalClusteringResult:
     """
     Re-evaluate and update cluster assignments for specific MacroInsights.
@@ -838,7 +852,7 @@ def assign_and_persist_macro_insights_incremental(
     session: Session,
     macro_insight_ids: Optional[List[int]] = None,
     include_assigned: bool = False,
-    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    similarity_threshold: Optional[float] = None,
 ) -> IncrementalClusteringResult:
     """
     End-to-end incremental macro insight clustering and persistence.
@@ -999,7 +1013,7 @@ class UnitInsightClusteringResult:
 def assign_unit_insight(
     unit_insight: UnitInsight,
     cluster_cache: ClusterEmbeddingCache,
-    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    similarity_threshold: Optional[float] = None,
 ) -> UnitInsightAssignment:
     """
     Assign a single orphan unit insight to a strategic cluster.
@@ -1040,7 +1054,7 @@ def assign_unit_insight(
 
 def assign_orphan_unit_insights_to_clusters(
     unit_insights: Sequence[UnitInsight],
-    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    similarity_threshold: Optional[float] = None,
     cluster_cache: Optional[ClusterEmbeddingCache] = None,
 ) -> UnitInsightClusteringResult:
     """
@@ -1057,6 +1071,9 @@ def assign_orphan_unit_insights_to_clusters(
     Returns:
         UnitInsightClusteringResult with all assignments and statistics
     """
+    if similarity_threshold is None:
+        similarity_threshold = _default_cluster_threshold()
+
     if not unit_insights:
         log.info("[CLUSTER] No orphan unit insights to process")
         return UnitInsightClusteringResult()
@@ -1143,7 +1160,7 @@ def persist_unit_insight_cluster_assignments(
 def assign_and_persist_orphan_unit_insights(
     session: Session,
     unit_insight_ids: Optional[List[int]] = None,
-    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    similarity_threshold: Optional[float] = None,
 ) -> UnitInsightClusteringResult:
     """
     End-to-end orphan unit insight clustering and persistence.

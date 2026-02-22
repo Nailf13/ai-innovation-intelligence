@@ -29,9 +29,6 @@ from innovation_intelligence.logger import get_logger
 
 log = get_logger(__name__)
 
-DEFAULT_SIMILARITY_THRESHOLD = 0.75
-MIN_CLUSTER_SIZE = 2  # Minimum UnitInsights required to form a MacroInsight
-
 
 # Data Structures (for internal use)
 @dataclass
@@ -216,6 +213,9 @@ def _parse_llm_label_response(response: dict) -> str:
 def generate_macro_label(
     unit_insights: List[UnitInsight],
     bedrock: BedrockClient,
+    *,
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
 ) -> str:
     """
     Generate a concise macro insight label from grouped unit insights using LLM.
@@ -223,10 +223,17 @@ def generate_macro_label(
     Args:
         unit_insights: List of UnitInsight DB models
         bedrock: Bedrock client instance
+        max_tokens: Override for max tokens (default from AnalysisConfig)
+        temperature: Override for temperature (default from AnalysisConfig)
 
     Returns:
         Concise label string (5-8 words)
     """
+    from innovation_intelligence.analysis.analysis_config import get_analysis_config
+    cfg = get_analysis_config().llm_naming
+    max_tokens = max_tokens if max_tokens is not None else cfg.label_max_tokens
+    temperature = temperature if temperature is not None else cfg.label_temperature
+
     items = "\n".join(f"- {ui.name}: {ui.description}" for ui in unit_insights)
 
     prompt = f"""You are a healthcare strategy analyst.
@@ -249,8 +256,8 @@ Return ONLY valid JSON:
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 120,
-        "temperature": 0.2,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
     }
 
     response = bedrock.invoke(payload)
@@ -261,6 +268,9 @@ def generate_macro_description(
     label: str,
     unit_insights: List[UnitInsight],
     bedrock: BedrockClient,
+    *,
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
 ) -> str:
     """
     Generate a description for a macro insight.
@@ -269,10 +279,17 @@ def generate_macro_description(
         label: The macro insight label
         unit_insights: List of UnitInsight DB models
         bedrock: Bedrock client instance
+        max_tokens: Override for max tokens (default from AnalysisConfig)
+        temperature: Override for temperature (default from AnalysisConfig)
 
     Returns:
         Description string (1-2 sentences)
     """
+    from innovation_intelligence.analysis.analysis_config import get_analysis_config
+    cfg = get_analysis_config().llm_naming
+    max_tokens = max_tokens if max_tokens is not None else cfg.description_max_tokens
+    temperature = temperature if temperature is not None else cfg.description_temperature
+
     items = "\n".join(f"- {ui.name}" for ui in unit_insights[:5])
 
     prompt = f"""You are a healthcare strategy analyst.
@@ -290,8 +307,8 @@ Return ONLY the description text, no JSON or formatting."""
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 200,
-        "temperature": 0.3,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
     }
 
     response = bedrock.invoke(payload)
@@ -306,8 +323,8 @@ Return ONLY the description text, no JSON or formatting."""
 # Core Clustering Algorithm
 def cluster_unit_insights(
     unit_insights: List[UnitInsight],
-    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
-    min_cluster_size: int = MIN_CLUSTER_SIZE,
+    similarity_threshold: Optional[float] = None,
+    min_cluster_size: Optional[int] = None,
 ) -> tuple[List[tuple[List[int], np.ndarray]], List[int]]:
     """
     Cluster unit insights by embedding similarity using greedy algorithm.
@@ -317,14 +334,21 @@ def cluster_unit_insights(
 
     Args:
         unit_insights: List of UnitInsight DB models (must have embeddings)
-        similarity_threshold: Minimum cosine similarity for clustering
-        min_cluster_size: Minimum number of UnitInsights to form a cluster (default 2)
+        similarity_threshold: Minimum cosine similarity for clustering (default from AnalysisConfig)
+        min_cluster_size: Minimum number of UnitInsights to form a cluster (default from AnalysisConfig)
 
     Returns:
         Tuple of:
         - List of (unit_insight_ids, centroid_vector) tuples for valid clusters
         - List of isolated UnitInsight IDs that remain unassigned
     """
+    from innovation_intelligence.analysis.analysis_config import get_analysis_config
+    cfg = get_analysis_config().thresholds
+    if similarity_threshold is None:
+        similarity_threshold = cfg.macro_discovery
+    if min_cluster_size is None:
+        min_cluster_size = cfg.min_cluster_size
+
     if not unit_insights:
         return [], []
 
@@ -374,7 +398,7 @@ def cluster_unit_insights(
 class IncrementalDiscoveryResult:
     """Result of incremental macro insight discovery."""
 
-    # New MacroInsights to create (clusters of >= MIN_CLUSTER_SIZE)
+    # New MacroInsights to create (clusters of >= min_cluster_size)
     new_candidates: List[MacroInsightCandidate]
 
     # Updates to existing MacroInsights (new UnitInsights injected)
@@ -389,7 +413,7 @@ def discover_macro_insights(
     session: Session,
     *,
     unit_insight_ids: Optional[List[int]] = None,
-    similarity_threshold: float = 0.72,
+    similarity_threshold: Optional[float] = None,
     use_llm_naming: bool = True,
     generate_descriptions: bool = False,
     bedrock: Optional[BedrockClient] = None,
@@ -407,7 +431,7 @@ def discover_macro_insights(
     Args:
         session: Database session
         unit_insight_ids: Optional list of UnitInsight IDs to process (default: all unassigned)
-        similarity_threshold: Minimum cosine similarity for clustering (default 0.72)
+        similarity_threshold: Minimum cosine similarity for clustering (default from AnalysisConfig)
         use_llm_naming: Use LLM to generate labels (default True)
         generate_descriptions: Also generate descriptions via LLM (default False)
         bedrock: Optional pre-configured BedrockClient
@@ -430,7 +454,7 @@ def discover_macro_insights_incremental(
     session: Session,
     *,
     unit_insight_ids: Optional[List[int]] = None,
-    similarity_threshold: float = 0.72,
+    similarity_threshold: Optional[float] = None,
     use_llm_naming: bool = True,
     generate_descriptions: bool = False,
     bedrock: Optional[BedrockClient] = None,
@@ -449,7 +473,7 @@ def discover_macro_insights_incremental(
     Args:
         session: Database session
         unit_insight_ids: Optional list of UnitInsight IDs to process (default: all unassigned)
-        similarity_threshold: Minimum cosine similarity for clustering (default 0.72)
+        similarity_threshold: Minimum cosine similarity for clustering (default from AnalysisConfig)
         use_llm_naming: Use LLM to generate labels (default True)
         generate_descriptions: Also generate descriptions via LLM (default False)
         bedrock: Optional pre-configured BedrockClient
@@ -457,6 +481,10 @@ def discover_macro_insights_incremental(
     Returns:
         IncrementalDiscoveryResult with new candidates, updates, and isolated IDs
     """
+    if similarity_threshold is None:
+        from innovation_intelligence.analysis.analysis_config import get_analysis_config
+        similarity_threshold = get_analysis_config().thresholds.macro_discovery
+
     # Fetch unassigned unit insights
     query = session.query(UnitInsight).filter(UnitInsight.macro_insight_id.is_(None))
     if unit_insight_ids is not None:
@@ -497,7 +525,7 @@ def discover_macro_insights_incremental(
 
     # Step 2: Cluster unmatched UnitInsights among themselves
     clusters, isolated_ids = cluster_unit_insights(
-        unmatched, similarity_threshold, min_cluster_size=MIN_CLUSTER_SIZE
+        unmatched, similarity_threshold,
     )
 
     if isolated_ids:
@@ -692,7 +720,7 @@ def discover_and_persist_macro_insights(
     session: Session,
     *,
     unit_insight_ids: Optional[List[int]] = None,
-    similarity_threshold: float = 0.72,
+    similarity_threshold: Optional[float] = None,
     use_llm_naming: bool = True,
     generate_descriptions: bool = False,
     bedrock: Optional[BedrockClient] = None,
@@ -704,17 +732,10 @@ def discover_and_persist_macro_insights(
     MacroInsights. For full incremental results including updates, use
     `discover_and_persist_macro_insights_incremental`.
 
-    Steps:
-    1. Fetch unassigned UnitInsights from DB
-    2. Match against existing MacroInsight centroids (inject if similar)
-    3. Cluster remaining unmatched UnitInsights
-    4. Only create new MacroInsights for clusters with >= 2 members
-    5. Isolated UnitInsights remain unassigned for future clustering
-
     Args:
         session: Database session
         unit_insight_ids: Optional list of UnitInsight IDs to process (default: all unassigned)
-        similarity_threshold: Minimum cosine similarity for clustering
+        similarity_threshold: Minimum cosine similarity for clustering (default from AnalysisConfig)
         use_llm_naming: Use LLM to generate labels
         generate_descriptions: Also generate descriptions via LLM
         bedrock: Optional pre-configured BedrockClient
@@ -737,7 +758,7 @@ def discover_and_persist_macro_insights_incremental(
     session: Session,
     *,
     unit_insight_ids: Optional[List[int]] = None,
-    similarity_threshold: float = 0.72,
+    similarity_threshold: Optional[float] = None,
     use_llm_naming: bool = True,
     generate_descriptions: bool = False,
     bedrock: Optional[BedrockClient] = None,
@@ -745,18 +766,10 @@ def discover_and_persist_macro_insights_incremental(
     """
     Incremental macro insight discovery and persistence.
 
-    Full incremental workflow:
-    1. Fetch unassigned UnitInsights from DB
-    2. Match against existing MacroInsight centroids
-       - If similarity >= threshold, inject into existing MacroInsight and update centroid
-    3. Cluster remaining unmatched UnitInsights
-    4. Only create new MacroInsights for clusters with >= 2 members
-    5. Isolated UnitInsights remain unassigned for future clustering
-
     Args:
         session: Database session
         unit_insight_ids: Optional list of UnitInsight IDs to process (default: all unassigned)
-        similarity_threshold: Minimum cosine similarity for clustering
+        similarity_threshold: Minimum cosine similarity for clustering (default from AnalysisConfig)
         use_llm_naming: Use LLM to generate labels
         generate_descriptions: Also generate descriptions via LLM
         bedrock: Optional pre-configured BedrockClient

@@ -1,4 +1,0 @@
-sqlalchemy
-python-dotenv
-google-cloud-aiplatform
-google-cloud-storage

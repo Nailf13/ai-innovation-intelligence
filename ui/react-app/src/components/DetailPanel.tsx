@@ -108,7 +108,7 @@ interface DetailPanelProps {
   onSelectMacro: (id: number) => void;
   onSelectUnit: (id: number) => void;
   onOpenVideo: (url: string, start: number, end?: number, title?: string, subtitle?: string) => void;
-  onOpenPdf: (url: string, page: number, title: string) => void;
+  onOpenPdf: (url: string, page: number, title: string, cacheKey?: string) => void;
 }
 
 export function DetailPanel({
@@ -436,7 +436,7 @@ function UnitDetail({
 }: {
   unit: UnitInsight;
   onOpenVideo: (url: string, start: number, end?: number, title?: string, subtitle?: string) => void;
-  onOpenPdf: (url: string, page: number, title: string) => void;
+  onOpenPdf: (url: string, page: number, title: string, cacheKey?: string) => void;
 }) {
   // State for audio player modal - keep audio loaded once opened
   const [audioPlayerState, setAudioPlayerState] = useState<{
@@ -452,6 +452,7 @@ function UnitDetail({
     url: string;
     page: number;
     title: string;
+    cacheKey?: string;
   } | null>(null);
 
   // Handlers for media playback
@@ -465,8 +466,8 @@ function UnitDetail({
     }
   };
 
-  const handleOpenPdf = (url: string, page: number, title: string) => {
-    setPdfModalState({ open: true, url, page, title });
+  const handleOpenPdf = (url: string, page: number, title: string, cacheKey?: string) => {
+    setPdfModalState({ open: true, url, page, title, cacheKey });
   };
 
   const adoptionDim = unit.dimensions.find((d) => d.dimension_type === 'adoption');
@@ -629,6 +630,7 @@ function UnitDetail({
           pdfUrl={pdfModalState.url}
           initialPage={pdfModalState.page}
           title={pdfModalState.title}
+          cacheKey={pdfModalState.cacheKey}
           onClose={() => setPdfModalState(null)}
         />
       )}

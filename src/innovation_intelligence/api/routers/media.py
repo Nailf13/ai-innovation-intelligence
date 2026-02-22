@@ -137,10 +137,10 @@ async def get_signed_url(
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"[Media] Failed to generate signed URL: {e}", exc_info=True)
+        log.warning(f"[Media] Signed URL unavailable (proxy fallback active): {e}")
         raise HTTPException(
-            status_code=500,
-            detail=f"Failed to generate signed URL: {str(e)}"
+            status_code=503,
+            detail="Signed URLs not available — use proxy endpoint instead"
         )
 
 

@@ -94,7 +94,7 @@ def search_podcasts(request: PodcastSearchRequest):
 
 
 @router.get("/episodes/{feed_id}", response_model=EpisodeListResponse)
-def list_episodes(feed_id: int, limit: int = 20, offset: int = 0):
+def list_episodes(feed_id: int, limit: int = 20, offset: int = 0, db: Session = Depends(get_db)):
     """
     List episodes from a podcast feed with offset-based pagination.
 
@@ -136,6 +136,17 @@ def list_episodes(feed_id: int, limit: int = 20, offset: int = 0):
                 audio_url=ep.get("enclosureUrl", ""),
                 image_url=ep.get("image"),
             ))
+
+        # Cross-reference with DB to flag already-added episodes
+        audio_urls = [ep.audio_url for ep in episodes if ep.audio_url]
+        if audio_urls:
+            rows = db.query(PodcastEpisode.audio_url).filter(
+                PodcastEpisode.audio_url.in_(audio_urls)
+            ).all()
+            existing = {r[0] for r in rows if r[0]}
+            for ep in episodes:
+                if ep.audio_url in existing:
+                    ep.already_added = True
 
         return EpisodeListResponse(
             feed_id=feed_id,

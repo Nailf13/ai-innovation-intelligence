@@ -32,6 +32,21 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/insights", tags=["insights"])
 
 
+def _strip_podcast_overlap(chunk_text: str) -> str:
+    """Strip overlap prefix from podcast chunk text for display.
+
+    Podcast chunks are stored as "{overlap}\n\n{original_text}".
+    The timestamps correspond to original_text only.
+    Reliable for podcasts: speech segments never contain \n\n.
+    """
+    if not chunk_text:
+        return chunk_text
+    idx = chunk_text.find("\n\n")
+    if idx == -1:
+        return chunk_text  # First chunk (no overlap)
+    return chunk_text[idx + 2:]
+
+
 def _get_source_info(ui: UnitInsight) -> tuple[str, Optional[int]]:
     """Get source type and ID from UnitInsight."""
     if ui.episode_id:
@@ -133,9 +148,15 @@ def get_unit_insight(insight_id: int, db: Session = Depends(get_db)):
             # Resolve source_ref to source_id
             evidence_source_type, evidence_source_id = _resolve_source_to_id(e.source_ref, db)
 
+            # Calculate display_text for podcasts (strip overlap)
+            display_text = None
+            if evidence_source_type == "podcast":
+                display_text = _strip_podcast_overlap(e.chunk_text)
+
             evidence_items.append(
                 EvidenceItem(
                     text=e.chunk_text,
+                    display_text=display_text,
                     source_ref=e.source_ref,
                     similarity_score=e.similarity_score,
                     source_id=evidence_source_id,

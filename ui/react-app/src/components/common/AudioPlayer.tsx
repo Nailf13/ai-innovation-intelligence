@@ -1,5 +1,5 @@
 import { useRef, useState, useEffect } from 'react';
-import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX } from 'lucide-react';
+import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, Loader2 } from 'lucide-react';
 import clsx from 'clsx';
 
 interface AudioPlayerProps {
@@ -16,16 +16,28 @@ export function AudioPlayer({ src, title, initialTime = 0, onTimeUpdate }: Audio
   const [duration, setDuration] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
   const [volume, setVolume] = useState(1);
+  const [isLoading, setIsLoading] = useState(false);
 
-  // Seek to initial time when it changes (for timestamp navigation)
+  // Detect if src is a signed URL (direct GCS access) vs proxy
+  const isSignedUrl = src.includes('storage.googleapis.com') || src.includes('X-Goog-');
+
+  // Seek to initial time when metadata is loaded or initialTime changes
   useEffect(() => {
-    if (audioRef.current && initialTime > 0) {
-      audioRef.current.currentTime = initialTime;
-      // Auto-play when jumping to a new timestamp
-      if (!isPlaying) {
-        audioRef.current.play();
-        setIsPlaying(true);
-      }
+    const audio = audioRef.current;
+    if (!audio || initialTime <= 0) return;
+
+    const seekAndPlay = () => {
+      audio.currentTime = initialTime;
+      audio.play().then(() => setIsPlaying(true)).catch(() => {});
+    };
+
+    // If metadata already loaded, seek immediately
+    if (audio.readyState >= 1) {
+      seekAndPlay();
+    } else {
+      // Wait for metadata then seek
+      audio.addEventListener('loadedmetadata', seekAndPlay, { once: true });
+      return () => audio.removeEventListener('loadedmetadata', seekAndPlay);
     }
   }, [initialTime]);
 
@@ -108,10 +120,13 @@ export function AudioPlayer({ src, title, initialTime = 0, onTimeUpdate }: Audio
       <audio
         ref={audioRef}
         src={src}
-        preload="metadata"
+        preload={isSignedUrl ? "auto" : "metadata"}
+        crossOrigin={isSignedUrl ? "anonymous" : undefined}
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
         onEnded={() => setIsPlaying(false)}
+        onWaiting={() => setIsLoading(true)}
+        onCanPlay={() => setIsLoading(false)}
       />
 
       {title && (
@@ -156,8 +171,11 @@ export function AudioPlayer({ src, title, initialTime = 0, onTimeUpdate }: Audio
           <button
             onClick={handlePlayPause}
             className="p-3 bg-savencia-primary hover:bg-savencia-primary-dark text-white rounded-full transition-colors"
+            disabled={isLoading}
           >
-            {isPlaying ? (
+            {isLoading ? (
+              <Loader2 className="w-5 h-5 animate-spin" />
+            ) : isPlaying ? (
               <Pause className="w-5 h-5" />
             ) : (
               <Play className="w-5 h-5 ml-0.5" />

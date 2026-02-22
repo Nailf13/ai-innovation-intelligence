@@ -38,6 +38,8 @@ export interface PodcastEpisode {
   transcript_path?: string;
   episode_date?: string;
   created_at: string;
+  audio_duration_seconds?: number;
+  audio_file_size?: number;
 }
 
 export interface PodcastEpisodeInfo {
@@ -48,6 +50,7 @@ export interface PodcastEpisodeInfo {
   duration?: number;
   audio_url: string;
   image_url?: string;
+  already_added?: boolean;
 }
 
 export interface EpisodeListResponse {
@@ -133,6 +136,7 @@ export interface PipelineStats {
 // Insight Types
 export interface EvidenceItem {
   text: string;
+  display_text?: string;
   source_ref?: string;
   similarity_score?: number;
   // Source identification (episode_id or document_id)

@@ -71,7 +71,10 @@ export function PodcastsPage() {
       console.error('SSE connection error:', error);
     },
     onOpen: () => {
-      console.log('SSE connection established');
+      console.log('[SSE] Connection established');
+      // Fetch current status when SSE connects to catch any status changes that happened
+      // before the connection was established (e.g., when navigating from analysis page)
+      queryClient.invalidateQueries({ queryKey: ['podcasts', 'saved'] });
     },
   });
 
@@ -219,7 +222,8 @@ export function PodcastsPage() {
     }
   };
 
-  const handleToggleEpisode = (episodeId: number) => {
+  const handleToggleEpisode = (episodeId: number, alreadyAdded?: boolean) => {
+    if (alreadyAdded) return;
     setSelectedEpisodes((prev) => {
       const next = new Set(prev);
       if (next.has(episodeId)) {
@@ -512,22 +516,33 @@ export function PodcastsPage() {
                           <label
                             key={ep.id}
                             className={clsx(
-                              'flex items-start gap-3 p-3 rounded-lg cursor-pointer transition-colors',
-                              selectedEpisodes.has(ep.id)
-                                ? 'bg-savencia-primary/10 border border-savencia-primary'
-                                : 'bg-gray-50 hover:bg-gray-100 border border-transparent'
+                              'flex items-start gap-3 p-3 rounded-lg transition-colors',
+                              ep.already_added
+                                ? 'bg-green-50 border border-green-200 cursor-default'
+                                : selectedEpisodes.has(ep.id)
+                                  ? 'bg-savencia-primary/10 border border-savencia-primary cursor-pointer'
+                                  : 'bg-gray-50 hover:bg-gray-100 border border-transparent cursor-pointer'
                             )}
                           >
                             <input
                               type="checkbox"
-                              checked={selectedEpisodes.has(ep.id)}
-                              onChange={() => handleToggleEpisode(ep.id)}
+                              checked={ep.already_added || selectedEpisodes.has(ep.id)}
+                              disabled={ep.already_added}
+                              onChange={() => handleToggleEpisode(ep.id, ep.already_added)}
                               className="mt-1"
                             />
                             <div className="flex-1 min-w-0">
-                              <p className="font-medium text-sm truncate">
-                                {ep.title}
-                              </p>
+                              <div className="flex items-center gap-2">
+                                <p className="font-medium text-sm truncate">
+                                  {ep.title}
+                                </p>
+                                {ep.already_added && (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700 whitespace-nowrap">
+                                    <CheckCircle className="w-3 h-3" />
+                                    Already added
+                                  </span>
+                                )}
+                              </div>
                               <div className="flex items-center gap-3 mt-1">
                                 {ep.date_published && (
                                   <span className="text-xs text-gray-500 flex items-center gap-1">

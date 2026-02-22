@@ -1,5 +1,8 @@
 # src/innovation_intelligence/api/main.py
 """FastAPI application entry point."""
+import asyncio
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -12,14 +15,28 @@ from innovation_intelligence.api.routers import (
     media_proxy_router as media_proxy,
 )
 from innovation_intelligence.api.routers.insight_views import router as insights_router
+from innovation_intelligence.analysis.insights.embedder import preload_model
 from innovation_intelligence.logger import get_logger
 
 log = get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown lifecycle for the API."""
+    # Load embedding model in a thread so we don't block the event loop
+    log.info("[STARTUP] Preloading embedding model...")
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, preload_model)
+    log.info("[STARTUP] Embedding model ready")
+    yield
+
 
 app = FastAPI(
     title="Innovation Intelligence API",
     description="API for health trend analysis from podcasts and documents",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(

@@ -40,7 +40,11 @@ SourceEntity = Union[PodcastEpisode, Document]
 # ---------------------------------------------------------------------
 @dataclass
 class AnalysisPipelineConfig:
-    """Configuration for the analysis pipeline."""
+    """Configuration for the analysis pipeline.
+
+    All defaults are derived from the central AnalysisConfig.
+    Use ``AnalysisPipelineConfig.from_analysis_config()`` for canonical defaults.
+    """
 
     # Stage toggles
     run_extraction: bool = True
@@ -56,16 +60,41 @@ class AnalysisPipelineConfig:
     dimension_min_similarity: float = 0.4
 
     # Macro insight discovery settings
-    macro_similarity_threshold: float = 0.7
+    macro_similarity_threshold: float = 0.72
     use_llm_naming: bool = True
     generate_macro_descriptions: bool = True
 
     # Strategic clustering settings
     cluster_similarity_threshold: float = 0.5
 
+    # Deduplication threshold
+    dedup_threshold: float = 0.90
+
     # Processing options
-    batch_size: int = 10  # Process N sources at a time
-    continue_on_error: bool = True  # Continue if one source fails
+    batch_size: int = 10
+    continue_on_error: bool = True
+    max_workers: int = 3
+
+    @classmethod
+    def from_analysis_config(cls, cfg: "AnalysisConfig") -> "AnalysisPipelineConfig":
+        """Construct from the central AnalysisConfig."""
+        return cls(
+            run_extraction=cfg.run_extraction,
+            run_dimension_assessment=cfg.run_dimension_assessment,
+            run_macro_discovery=cfg.run_macro_discovery,
+            run_strategic_clustering=cfg.run_strategic_clustering,
+            force_reextract=cfg.force_reextract,
+            dimension_top_k=cfg.rag.top_k,
+            dimension_min_similarity=cfg.rag.min_similarity,
+            macro_similarity_threshold=cfg.thresholds.macro_discovery,
+            use_llm_naming=cfg.llm_naming.use_llm_naming,
+            generate_macro_descriptions=cfg.llm_naming.generate_descriptions,
+            cluster_similarity_threshold=cfg.thresholds.strategic_clustering,
+            dedup_threshold=cfg.thresholds.dedup,
+            batch_size=cfg.processing.batch_size,
+            continue_on_error=cfg.processing.continue_on_error,
+            max_workers=cfg.processing.max_workers,
+        )
 
 
 @dataclass
@@ -149,8 +178,185 @@ class PipelineResult:
 
 
 # ---------------------------------------------------------------------
-# Stage 1: Insight Extraction
+# Stage 1: Insight Extraction (Parallelized)
 # ---------------------------------------------------------------------
+def _extract_single_source(
+    source_id: int,
+    source_type: str,
+    gcs_uri: str,
+    force: bool,
+    client: "GeminiClient",
+) -> Dict[str, Any]:
+    """
+    Worker function for parallel extraction. Runs in a thread.
+
+    Performs I/O-bound work (GCS load + LLM extraction + embedding) without
+    any DB writes. Returns a dict with results for sequential persistence.
+
+    Args:
+        source_id: ID of the source entity
+        source_type: "episode" or "document"
+        gcs_uri: GCS URI for the transcript
+        force: Whether to force re-extraction
+        client: Shared GeminiClient (thread-safe)
+
+    Returns:
+        Dict with extraction results or error info
+    """
+    from innovation_intelligence.analysis.insights.insight_extraction import (
+        extract_insights_from_transcript,
+        _get_existing_insights_count,
+        _is_episode,
+        Insight,
+    )
+    from innovation_intelligence.analysis.insights.embedder import embed_text
+    from innovation_intelligence.db.session import SessionLocal
+    from innovation_intelligence.db.models import PodcastEpisode, Document
+
+    result_dict: Dict[str, Any] = {
+        "source_id": source_id,
+        "source_type": source_type,
+        "error": None,
+        "extraction": None,
+        "embeddings": [],  # List of (insight_index, embedding) pairs
+        "skipped": False,
+    }
+
+    # Check if already extracted using a thread-local session
+    local_session = SessionLocal()
+    try:
+        if source_type == "episode":
+            source = local_session.get(PodcastEpisode, source_id)
+        else:
+            source = local_session.get(Document, source_id)
+
+        if source is None:
+            result_dict["error"] = f"Source {source_type}:{source_id} not found"
+            return result_dict
+
+        existing_count = _get_existing_insights_count(local_session, source)
+        if existing_count > 0 and not force:
+            log.info(
+                f"[PIPELINE] {existing_count} insights already exist for "
+                f"{source_type}:{source_id}, skipping"
+            )
+            result_dict["skipped"] = True
+            return result_dict
+    finally:
+        local_session.close()
+
+    # Phase 1: I/O-bound work (GCS + LLM + embeddings) — no DB writes
+    try:
+        extraction = extract_insights_from_transcript(
+            gcs_uri=gcs_uri,
+            client=client,
+        )
+        result_dict["extraction"] = extraction
+
+        # Compute embeddings for each insight
+        for i, ins in enumerate(extraction.insights):
+            embedding = embed_text(f"{ins.name}. {ins.description}")
+            result_dict["embeddings"].append((i, embedding))
+
+        log.info(
+            f"[PIPELINE] Extracted {len(extraction.insights)} insights "
+            f"from {source_type}:{source_id}"
+        )
+
+    except Exception as e:
+        result_dict["error"] = f"Extraction failed for {source_type}:{source_id}: {e}"
+        log.error(f"[PIPELINE] {result_dict['error']}")
+
+    return result_dict
+
+
+def _persist_extracted_insights(
+    session: Session,
+    extraction_results: List[Dict[str, Any]],
+    sources_by_id: Dict[int, SourceEntity],
+    dedup_threshold: float = 0.90,
+) -> tuple[int, int]:
+    """
+    Persist extracted insights sequentially in the main thread.
+
+    Handles deduplication by checking similarity against all existing
+    insights (including those just inserted from previous sources).
+
+    Args:
+        session: Main-thread DB session
+        extraction_results: List of dicts from _extract_single_source()
+        sources_by_id: Map of source.id -> SourceEntity
+        dedup_threshold: Similarity threshold for deduplication
+
+    Returns:
+        Tuple of (sources_processed, insights_created)
+    """
+    from innovation_intelligence.analysis.insights.insight_extraction import (
+        _find_most_similar_insight,
+        _merge_sources,
+        _is_episode,
+    )
+
+    sources_processed = 0
+    insights_created = 0
+
+    for res in extraction_results:
+        if res["error"] or res["skipped"] or res["extraction"] is None:
+            continue
+
+        source = sources_by_id.get(res["source_id"])
+        if source is None:
+            continue
+
+        extraction = res["extraction"]
+        embeddings_map = dict(res["embeddings"])  # index -> embedding
+
+        created = 0
+        updated = 0
+
+        for i, ins in enumerate(extraction.insights):
+            embedding = embeddings_map.get(i)
+            if embedding is None:
+                continue
+
+            # Dedup check — sees all previously committed insights
+            similar_insight, similarity = _find_most_similar_insight(
+                session, embedding, threshold=dedup_threshold
+            )
+
+            if similar_insight is not None:
+                log.info(
+                    "[PIPELINE] Dedup: '%.50s' ~ '%.50s' (%.3f) -> merging",
+                    ins.name,
+                    similar_insight.name,
+                    similarity,
+                )
+                _merge_sources(similar_insight, source)
+                updated += 1
+            else:
+                unit_insight = UnitInsight(
+                    name=ins.name,
+                    description=ins.description,
+                    type=ins.type,
+                    embedding=embedding,
+                    episode_id=source.id if _is_episode(source) else None,
+                    document_id=source.id if not _is_episode(source) else None,
+                )
+                session.add(unit_insight)
+                created += 1
+
+        session.commit()
+        sources_processed += 1
+        insights_created += created + updated
+
+        log.info(
+            f"[PIPELINE] Persisted insights for {source}: "
+            f"{created} created, {updated} deduplicated"
+        )
+
+    return sources_processed, insights_created
+
+
 def _run_extraction_stage(
     session: Session,
     sources: List[SourceEntity],
@@ -158,51 +364,98 @@ def _run_extraction_stage(
     config: AnalysisPipelineConfig,
 ) -> StageResult:
     """
-    Run the insight extraction stage.
+    Run the insight extraction stage with parallel workers.
 
-    GCS-first mode: Only GCS URIs are supported as transcript sources.
+    Phase 1 (parallel): GCS load + LLM extraction + embedding in threads.
+    Phase 2 (sequential): Dedup + DB persistence in the main thread.
     """
     import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from innovation_intelligence.analysis.insights.insight_extraction import (
-        extract_and_persist_insights,
+        _get_default_client,
+        _is_episode,
     )
 
     start = time.time()
     result = StageResult(stage_name="1. Insight Extraction", success=True)
 
+    # Build work items
+    work_items = []
+    sources_by_id: Dict[int, SourceEntity] = {}
     for source in sources:
-        transcript_source = transcript_sources.get(source.id)
-        if not transcript_source:
+        gcs_uri = transcript_sources.get(source.id)
+        if not gcs_uri:
             result.errors.append(f"No transcript for source {source.id}")
             continue
+        source_type = "episode" if _is_episode(source) else "document"
+        work_items.append((source.id, source_type, gcs_uri))
+        sources_by_id[source.id] = source
 
-        try:
-            extraction, unit_insights = extract_and_persist_insights(
-                gcs_uri=transcript_source,
-                session=session,
-                source=source,
-                force=config.force_reextract,
-            )
+    if not work_items:
+        result.duration_seconds = time.time() - start
+        return result
 
-            result.items_processed += 1
-            result.items_created += len(unit_insights)
+    # Shared GeminiClient (thread-safe)
+    client = _get_default_client()
 
-            log.info(
-                f"[PIPELINE] Extracted {len(unit_insights)} insights from {source}"
-            )
+    # Phase 1: Parallel extraction
+    num_workers = min(config.max_workers, len(work_items))
+    log.info(
+        f"[PIPELINE] Starting parallel extraction: "
+        f"{len(work_items)} sources, {num_workers} workers"
+    )
 
-        except Exception as e:
-            error_msg = f"Extraction failed for {source}: {e}"
-            log.error(f"[PIPELINE] {error_msg}")
-            result.errors.append(error_msg)
+    extraction_results: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        future_to_source = {
+            executor.submit(
+                _extract_single_source,
+                source_id,
+                source_type,
+                gcs_uri,
+                config.force_reextract,
+                client,
+            ): source_id
+            for source_id, source_type, gcs_uri in work_items
+        }
 
-            if not config.continue_on_error:
-                result.success = False
-                break
+        for future in as_completed(future_to_source):
+            source_id = future_to_source[future]
+            try:
+                res = future.result()
+                extraction_results.append(res)
 
+                if res["error"]:
+                    result.errors.append(res["error"])
+                    if not config.continue_on_error:
+                        # Cancel remaining futures
+                        for f in future_to_source:
+                            f.cancel()
+                        result.success = False
+                        break
+
+            except Exception as e:
+                error_msg = f"Worker exception for source {source_id}: {e}"
+                log.error(f"[PIPELINE] {error_msg}")
+                result.errors.append(error_msg)
+                if not config.continue_on_error:
+                    for f in future_to_source:
+                        f.cancel()
+                    result.success = False
+                    break
+
+    # Phase 2: Sequential persistence with dedup
+    log.info("[PIPELINE] Persisting extracted insights (sequential dedup)...")
+    sources_processed, insights_created = _persist_extracted_insights(
+        session, extraction_results, sources_by_id,
+        dedup_threshold=config.dedup_threshold,
+    )
+
+    result.items_processed = sources_processed
+    result.items_created = insights_created
     result.duration_seconds = time.time() - start
-    result.details["sources_processed"] = result.items_processed
-    result.details["insights_extracted"] = result.items_created
+    result.details["sources_processed"] = sources_processed
+    result.details["insights_extracted"] = insights_created
 
     if result.errors and not config.continue_on_error:
         result.success = False
@@ -377,64 +630,187 @@ def _run_strategic_clustering_stage(
 
 
 # ---------------------------------------------------------------------
-# Stage 4: Dimension Assessment
+# Stage 4: Dimension Assessment (Parallelized)
 # ---------------------------------------------------------------------
+def _assess_single_insight(
+    insight_id: int,
+    assessment_config: "AssessmentConfig",
+    gemini_client: "GeminiClient",
+) -> Dict[str, Any]:
+    """
+    Worker function for parallel dimension assessment. Runs in a thread.
+
+    Each worker gets its own DB session and DimensionAssessmentService.
+    Persistence happens directly in the worker (no cross-insight dedup needed).
+
+    Args:
+        insight_id: ID of the UnitInsight to assess
+        assessment_config: Shared assessment configuration
+        gemini_client: Shared GeminiClient (thread-safe)
+
+    Returns:
+        Dict with assessment results or error info
+    """
+    from innovation_intelligence.analysis.dimensions import (
+        DimensionAssessmentService,
+    )
+    from innovation_intelligence.db.session import SessionLocal
+
+    result_dict: Dict[str, Any] = {
+        "insight_id": insight_id,
+        "dimensions_created": 0,
+        "error": None,
+    }
+
+    local_session = SessionLocal()
+    try:
+        insight = local_session.get(UnitInsight, insight_id)
+        if insight is None:
+            result_dict["error"] = f"Insight {insight_id} not found"
+            return result_dict
+
+        # Each worker gets its own service with its own session + RAG engine
+        service = DimensionAssessmentService(
+            local_session, assessment_config, gemini_client
+        )
+
+        assessment = service.assess_insight(insight)
+
+        # Count dimensions created
+        dims = 0
+        if hasattr(assessment, 'adoption'):
+            dims += sum([
+                1 if assessment.adoption else 0,
+                1 if assessment.expectation else 0,
+                1 if assessment.progress else 0,
+            ])
+        elif hasattr(assessment, 'criticality'):
+            dims += sum([
+                1 if assessment.criticality else 0,
+                1 if assessment.urgency else 0,
+                1 if assessment.actionability else 0,
+            ])
+
+        result_dict["dimensions_created"] = dims
+        log.info(
+            f"[PIPELINE] Assessed {dims} dimensions for insight {insight_id}"
+        )
+
+    except Exception as e:
+        result_dict["error"] = (
+            f"Assessment failed for insight {insight_id}: {e}"
+        )
+        log.error(f"[PIPELINE] {result_dict['error']}")
+    finally:
+        local_session.close()
+
+    return result_dict
+
+
 def _run_dimension_assessment_stage(
     session: Session,
     config: AnalysisPipelineConfig,
 ) -> StageResult:
     """
-    Run the dimension assessment stage.
+    Run the dimension assessment stage with parallel workers.
+
+    Each insight is assessed independently in its own thread with its own
+    DB session and DimensionAssessmentService instance.
     """
     import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from innovation_intelligence.analysis.dimensions import (
-        DimensionAssessmentService,
         AssessmentConfig,
         RAGEngineConfig,
     )
+    from innovation_intelligence.analysis.insights.insight_extraction import (
+        _get_default_client,
+    )
+    from innovation_intelligence.db.models import InsightDimension
 
     start = time.time()
     result = StageResult(stage_name="4. Dimension Assessment", success=True)
 
     try:
-        # Configure RAG
+        # Configure assessment
         rag_config = RAGEngineConfig(
             top_k=config.dimension_top_k,
             min_similarity=config.dimension_min_similarity,
         )
-
         assessment_config = AssessmentConfig(
             rag_config=rag_config,
             persist_results=True,
             skip_existing=True,
         )
 
-        service = DimensionAssessmentService(session, assessment_config)
+        # Query insight IDs needing assessment (main thread)
+        insight_ids = [
+            row[0]
+            for row in session.query(UnitInsight.id)
+            .outerjoin(InsightDimension)
+            .filter(InsightDimension.id.is_(None))
+            .all()
+        ]
 
-        # Get insights needing assessment
-        assessments = service.assess_new_insights()
+        if not insight_ids:
+            log.info("[PIPELINE] No insights needing dimension assessment")
+            result.duration_seconds = time.time() - start
+            return result
 
-        result.items_processed = len(assessments)
+        # Shared GeminiClient (thread-safe)
+        client = _get_default_client()
 
-        # Count dimensions created (handle both TrendDimensions and StakeDimensions)
-        dimensions_count = 0
-        for a in assessments:
-            # Check if it's a TrendDimensions (has adoption attribute)
-            if hasattr(a, 'adoption'):
-                dimensions_count += sum([
-                    1 if a.adoption else 0,
-                    1 if a.expectation else 0,
-                    1 if a.progress else 0,
-                ])
-            # Otherwise it's a StakeDimensions (has criticality attribute)
-            elif hasattr(a, 'criticality'):
-                dimensions_count += sum([
-                    1 if a.criticality else 0,
-                    1 if a.urgency else 0,
-                    1 if a.actionability else 0,
-                ])
+        num_workers = min(config.max_workers, len(insight_ids))
+        log.info(
+            f"[PIPELINE] Starting parallel assessment: "
+            f"{len(insight_ids)} insights, {num_workers} workers"
+        )
 
-        result.items_created = dimensions_count
+        # Parallel assessment
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            future_to_id = {
+                executor.submit(
+                    _assess_single_insight,
+                    iid,
+                    assessment_config,
+                    client,
+                ): iid
+                for iid in insight_ids
+            }
+
+            completed = 0
+            for future in as_completed(future_to_id):
+                iid = future_to_id[future]
+                completed += 1
+                try:
+                    res = future.result()
+
+                    if res["error"]:
+                        result.errors.append(res["error"])
+                        if not config.continue_on_error:
+                            for f in future_to_id:
+                                f.cancel()
+                            result.success = False
+                            break
+                    else:
+                        result.items_processed += 1
+                        result.items_created += res["dimensions_created"]
+
+                    if completed % 5 == 0 or completed == len(insight_ids):
+                        log.info(
+                            f"[PIPELINE] Assessment progress: "
+                            f"{completed}/{len(insight_ids)}"
+                        )
+
+                except Exception as e:
+                    error_msg = f"Worker exception for insight {iid}: {e}"
+                    log.error(f"[PIPELINE] {error_msg}")
+                    result.errors.append(error_msg)
+                    if not config.continue_on_error:
+                        for f in future_to_id:
+                            f.cancel()
+                        result.success = False
+                        break
 
         log.info(
             f"[PIPELINE] Assessed {result.items_created} dimensions "
@@ -652,19 +1028,21 @@ def run_analysis_from_insights(
 def run_clustering_only(
     session: Session,
     *,
-    macro_similarity_threshold: float = 0.7,
-    cluster_similarity_threshold: float = 0.5,
+    macro_similarity_threshold: Optional[float] = None,
+    cluster_similarity_threshold: Optional[float] = None,
 ) -> PipelineResult:
     """
     Run only the clustering stages (macro discovery + strategic clustering).
     """
+    from innovation_intelligence.analysis.analysis_config import get_analysis_config
+    defaults = get_analysis_config()
     config = AnalysisPipelineConfig(
         run_extraction=False,
         run_dimension_assessment=False,
         run_macro_discovery=True,
         run_strategic_clustering=True,
-        macro_similarity_threshold=macro_similarity_threshold,
-        cluster_similarity_threshold=cluster_similarity_threshold,
+        macro_similarity_threshold=macro_similarity_threshold if macro_similarity_threshold is not None else defaults.thresholds.macro_discovery,
+        cluster_similarity_threshold=cluster_similarity_threshold if cluster_similarity_threshold is not None else defaults.thresholds.strategic_clustering,
     )
 
     return run_full_analysis(session, config=config, sources=[], transcript_sources={})
